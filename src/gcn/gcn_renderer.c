@@ -605,7 +605,7 @@ static void GCNRenderer_renderCommands(GCNRenderer* r, uint32_t clearR, uint32_t
     float offsetY = (480.0f - targetH) * 0.5f;
 
     Mtx44 projection;
-    guOrtho(projection, 0.0f, 480.0f, 0.0f, 640.0f, 0.0f, 1000.0f);
+    guOrtho(projection, 0.0f, 480.0f, 0.0f, 640.0f, -1.0f, 1000.0f); // near=-1 so z=0 verts aren't clipped
     GX_LoadProjectionMtx(projection, GX_ORTHOGRAPHIC);
     GX_SetViewport(0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f);
     GX_SetScissor((u32) offsetX, (u32) offsetY, (u32) targetW, (u32) targetH);

@@ -27,7 +27,6 @@
 #include <fcntl.h>
 #include <fcntl.h>
 
-// EGG: the launcher's soul. SPAMTON G SPAMTON was here. [E.G.G. SYSTEM ONLINE]
 #define GCN_GAME_DIR "/apps/DELTARUNEGC"
 #define GCN_CRASH_LOG_DEFAULT "/apps/DELTARUNEGC/crash.log"
 #define GCN_CRASH_LOG_SD "fat:/apps/DELTARUNEGC/crash.log"
@@ -115,9 +114,49 @@ static void GCN_drawStatusScreen(void) {
     VIDEO_Flush();
 }
 
+// One tiny white square that marches across the top edge every frame.
+// If you see it on the TV, the GX->EFB->XFB->VI pipeline is ALIVE even when
+// the game's own drawing is black - that separates "renderer output broken"
+// from "game draws nothing".
+static void GCN_drawHeartbeatOverlay(void) {
+    static float hx = 0.0f;
+    hx += 4.0f;
+    if (hx > 636.0f) hx = 0.0f;
+
+    Mtx44 projection;
+    guOrtho(projection, 0.0f, 480.0f, 0.0f, 640.0f, -1.0f, 1000.0f);
+    GX_LoadProjectionMtx(projection, GX_ORTHOGRAPHIC);
+    GX_SetViewport(0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f);
+    GX_SetScissor(0, 0, 640, 480);
+    GX_SetZMode(GX_FALSE, GX_NEVER, GX_FALSE);
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetAlphaUpdate(GX_TRUE);
+    GX_SetCullMode(GX_CULL_NONE);
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+    GX_SetNumTevStages(1);
+    GX_SetNumChans(1);
+    GX_SetNumTexGens(0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_TEX0, GX_NONE);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position2f32(hx, 4.0f); GX_Color4u8(255, 255, 255, 255);
+        GX_Position2f32(hx + 4.0f, 4.0f); GX_Color4u8(255, 255, 255, 255);
+        GX_Position2f32(hx + 4.0f, 8.0f); GX_Color4u8(255, 255, 255, 255);
+        GX_Position2f32(hx, 8.0f); GX_Color4u8(255, 255, 255, 255);
+    GX_End();
+    GX_DrawDone();
+}
+
 static void GCN_videoPresent(void) {
     GX_SetZMode(GX_FALSE, GX_NEVER, GX_FALSE);
     GX_SetColorUpdate(GX_TRUE);
+    GCN_drawHeartbeatOverlay();
     GX_CopyDisp(gXfb[gXfbIndex], GX_TRUE);
     GX_DrawDone();
     VIDEO_SetNextFramebuffer(gXfb[gXfbIndex]);
@@ -365,12 +404,11 @@ static int GCN_gameMain(void) {
         RunnerKeyboard_beginFrame(runner->keyboard);
     }
 
-    audioSystem->vtable->destroy(audioSystem);
-    renderer->vtable->destroy(renderer);
-    Runner_free(runner);
-    GCNFileSystem_destroy((GCNFileSystem*) fileSystem);
-    VM_free(vm);
-    DataWin_free(dataWin);
+    // v13: cleanup caused crashes on Start - just report and park.
+    // (The user powers off anyway; a hang-free exit beats a crash.)
+    GCN_setStatus("exited - power off safe");
+    GCN_drawStatusScreen();
+    while (1) { usleep(1000); }
     return 0;
 }
 
