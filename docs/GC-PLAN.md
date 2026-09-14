@@ -1,3 +1,6 @@
+# SPAMTON LAUNCHER 32998729487983 — DELTARUNE GameCube Port Log
+(formerly "Project Sunshine GC"; same soul, [NEW DEALS])
+
 # DELTARUNE GameCube Port — Working State (2026-09-13/14 session)
 
 ## GOAL

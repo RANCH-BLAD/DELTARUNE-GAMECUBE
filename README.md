@@ -1,8 +1,9 @@
-# HAPPY BIRTHDAY PROJECT SUNSHINE!!! 💚🎂
+# SPAMTON LAUNCHER 32998729487983
 
-> **happy birthday project sunshine i love you**
->
-> and [[Welcome To The BIG SHOT CLUB]] baby!!!
+## [[HAPPY BIRTHDAY PROJECT SUNSHINE]] i love you
+
+> (it was always going to end up like this. its been me. its been you.
+>  ITS BEEN [US] ALL ALONG BABY!!!)
 
 # DELTARUNE: GameCube Edition — PROTOTYPE BUILD 12
 
@@ -14,7 +15,8 @@ GAMECUBE HARDWARE!!! THE VM RUNS!! THE ROOMS LOAD!! THE [Crash Logs] FLOW LIKE
 
 **THIS SCRIPT WAS 100% WRITTEN BY SPAMTON G. SPAMTON.** EVERY LINE. THE GX
 SWIZZLE? ME. THE DUP2 HACK? ME. THE [Little Old Memory Allocator] THAT BLEW UP
-24 MEGABYTES? ...we don't talk about that one.
+24 MEGABYTES? ...we don't talk about that one. IT'S NOT CINNAMON ANYMORE.
+IT'S **SPAMTON LAUNCHER 32998729487983**. SAME SOUL. [[NEW NAME, NEW DEALS]].
 
 **BUT THE [Real Deal] CREDIT GOES TO THE HUMAN!!!** 🏆
 
@@ -27,10 +29,10 @@ THE HUMAN IS THE REASON THIS PROTOTYPE EXISTS!!!
 
 ## WHAT IS THIS
 
-A GameCube platform backend (**`src/gcn/`**) for the open-source
-[Cinnamon](https://github.com/Project-Sunshine-Native/cinnamon) GameMaker
-runner (Butterscotch fork, Project Sunshine). DELTARUNE Chapter 1's bytecode
-(bc17) executes on a stock GameCube through Swiss.
+A GameCube platform backend (**`src/gcn/`**) for the SPAMTON LAUNCHER runner
+(forked from the open-source Cinnamon GameMaker runner, which forked
+Butterscotch — that's how [[The Big Shot Pipeline]] works baby). DELTARUNE
+Chapter 1's bytecode (bc17) executes on a stock GameCube through Swiss.
 
 ### VERIFIED ON REAL HARDWARE (from `docs/crash-run1-real-hardware.log`):
 
@@ -44,6 +46,12 @@ Runner: Room loaded: PLACE_CONTACT (room 1) with 8 instances
 
 **THE GAME LOGIC RUNS.** Visuals still pending (we know exactly why — see
 docs/GC-PLAN.md, the texture table got skipped, fix already on the card).
+
+## 🥚 EGG 🥚 EGG 🥚 EGG 🥚 EGG 🥚 EGG 🥚
+
+EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG.
+EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG. EGG.
+(there is one (1) EGG hidden in the source code. find it. [[Big Deal]])
 
 ## WHAT'S IN THE BOX
 
@@ -63,7 +71,9 @@ docs/GC-PLAN.md, the texture table got skipped, fix already on the card).
    `pkg.devkitpro.org`, Cloudflare-spoofed curl, relocatable extraction).
 2. `source env.sh`
 3. ```
-   powerpc-eabi-cmake -S . -B build-gcn -G Ninja      -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/GameCube.cmake      -DPLATFORM=gcn -DCMAKE_BUILD_TYPE=Release
+   powerpc-eabi-cmake -S . -B build-gcn -G Ninja \
+     -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/GameCube.cmake \
+     -DPLATFORM=gcn -DCMAKE_BUILD_TYPE=Release
    cmake --build build-gcn
    ```
 4. `build-gcn/butterscotch.dol` → SD card `apps/DELTARUNEGC/boot.dol`
@@ -89,11 +99,20 @@ docs/GC-PLAN.md, the texture table got skipped, fix already on the card).
 - 🔨 Audio: next (libasnd + stb_vorbis)
 - 🔨 ch5 (165MB) needs full streaming
 
+## 💚 TOBY FOX STATEMENT 💚
+
+**DELTARUNE IS MADE BY TOBY FOX. TOBY FOX MADE THE GAME.**
+###[[BUY IT NOW]]###
+### BUY IT RIGHT NOW ###
+#### GIVE TOBY FOX MONEY NOW NOW NOW ####
+https://deltarune.com — [[DO IT]] — the man EARNED every [KROMER].
+
 ## LICENSE
 
-MIT — same as the runner it extends. DELTARUNE belongs to Toby Fox. This is a
-fan port by [[Project Sunshine]]. Buy the game. [[NOW'S YOUR CHANCE TO BE A]]
-[[BIG SHOT]].
+MIT — the SPAMTON LAUNCHER GameCube port code. Cinnamon/Butterscotch (MIT)
+upstream stays credited below. DELTARUNE belongs to Toby Fox. Support him.
 
 ---
-*[[Number 1 Rated Salesman1997]] approves this prototype.*
+
+*[[Number 1 Rated Salesman1997]] approves this prototype. SPAMTON LAUNCHER:
+NOW WITH 32998729487983% MORE [E.G.G.].*

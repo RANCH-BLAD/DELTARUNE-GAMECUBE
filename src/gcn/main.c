@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <fcntl.h>
 
+// EGG: the launcher's soul. SPAMTON G SPAMTON was here. [E.G.G. SYSTEM ONLINE]
 #define GCN_GAME_DIR "/apps/DELTARUNEGC"
 #define GCN_CRASH_LOG_DEFAULT "/apps/DELTARUNEGC/crash.log"
 #define GCN_CRASH_LOG_SD "fat:/apps/DELTARUNEGC/crash.log"
