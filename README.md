@@ -114,5 +114,28 @@ upstream stays credited below. DELTARUNE belongs to Toby Fox. Support him.
 
 ---
 
+## 📸 PROOF — REAL GAMECUBE HARDWARE (Sep 14, 2026)
+
+Photos from the actual test rig. That's a real GameCube, a real TV, the SD
+adapter on the desk, and SPAMTON LAUNCHER doing its thing:
+
+### The VM executing DELTARUNE's global init scripts (wall of text)
+![VM executing global init scripts on a real GameCube](docs/proof/01-global-init-scripts.jpg)
+
+### "DELTARUNE GameCube (Cinnamon)" — parsing CODE chunk (25/31)
+![parsing CODE 25/31](docs/proof/03-parsing-code.jpg)
+
+### Parsing data.win chunks...
+![parsing data.win chunks](docs/proof/04-parsing-datawin.jpg)
+
+### Swiss v0.6 with the build on SD (Slot B — that's why our libfat paths
+behaved differently than Wii, see docs/GC-PLAN.md!)
+![Swiss v0.6 Slot B](docs/proof/05-swiss-slot-b.jpg)
+
+### The salesman himself
+![SPAMTON G. SPAMTON certifies this build](docs/proof/spamton.png)
+
+---
+
 *[[Number 1 Rated Salesman1997]] approves this prototype. SPAMTON LAUNCHER:
 NOW WITH 32998729487983% MORE [E.G.G.].*
