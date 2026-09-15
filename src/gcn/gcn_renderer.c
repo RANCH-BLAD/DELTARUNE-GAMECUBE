@@ -1,4 +1,7 @@
 #include "gcn_renderer.h"
+#include <gccore.h>
+#include <ogc/video_types.h>
+#include "gcn_software_renderer.h"
 
 #include "../data_win.h"
 #include "../text_utils.h"
@@ -19,28 +22,23 @@
 
 #define STBI_NO_THREAD_LOCALS
 #include <stb/image/stb_image.h>
+#include "image_decoder.h"
 
-#define GCN_MAX_QUADS 4096
+#define GCN_MAX_QUADS 1024
 #define GCN_RESIDENT_PAGES 2
-#define GCN_MAX_PAGE_DIM 1024
+#define GCN_MAX_PAGE_DIM 512
 #define GCN_VERTICES_PER_QUAD 6
 
 typedef struct {
     GXTexObj texObj;
     uint32_t width, height;
+    float scale;           // originalWidth / width (1.0 = no downscale; 2.0 = 2048->1024)
     uint32_t ownerTexture; // TXTR index; UINT32_MAX = free slot
     uint32_t lastUsedStamp;
     bool ready;
 } GCNTexturePage;
 
-typedef struct {
-    int32_t textureIndex; // -1 = white texture
-    float p00x, p00y, p10x, p10y, p01x, p01y;
-    float u0, v0, u1, v1;
-    uint32_t color0, color1;
-    float alpha;
-    bool gradient;
-} GCNQuadCommand;
+
 
 struct GCNRenderer {
     Renderer base;
@@ -70,6 +68,10 @@ static const char* gStartupError = NULL;
 // exact renderer call that was running when everything stopped.
 volatile const char* GCNRenderer_lastDrawCall = "none";
 volatile uint32_t GCNRenderer_frameCounter = 0;
+volatile uint32_t GCNRenderer_statsCommands = 0;
+volatile uint32_t GCNRenderer_statsBlitted = 0;
+volatile uint32_t GCNRenderer_statsSkipped = 0;
+volatile uint32_t GCNRenderer_statsCmdsTotal = 0;
 
 const char* GCNRenderer_getStartupError(Renderer* renderer) {
     (void) renderer;
@@ -128,6 +130,13 @@ static GCNTexturePage* GCNRenderer_findResident(GCNRenderer* r, uint32_t texture
     return NULL;
 }
 
+// Free a decoded RGBA buffer with the right deallocator.
+static void GCN_freePixels(uint8_t* pixels, bool fromStbi) {
+    if (pixels == NULL) return;
+    if (fromStbi) stbi_image_free(pixels);
+    else free(pixels);
+}
+
 static GCNTexturePage* GCNRenderer_ensurePage(GCNRenderer* r, uint32_t textureIndex) {
     GCNRenderer_lastDrawCall = "ensurePage";
     if (textureIndex >= r->pageCount) return NULL;
@@ -155,11 +164,19 @@ static GCNTexturePage* GCNRenderer_ensurePage(GCNRenderer* r, uint32_t textureIn
     GCNTexturePage* page = &r->pages[victim];
 
     int w = 0, h = 0, channels = 0;
+    uint32_t origW = 0, origH = 0;
     uint8_t* pixels = NULL;
     uint8_t* png = NULL;
+    bool pixelsFromStbi = false; // 2zoq decodes come from plain malloc
     if (tex->blobData != NULL && tex->blobSize > 0) {
         // Parser already loaded the blob (parseTxtr=true path).
-        pixels = stbi_load_from_memory(tex->blobData, (int) tex->blobSize, &w, &h, &channels, 4);
+        // GameMaker 2022.9+ blobs are '2zoq' (BZip2+QOI):
+        if (tex->blobSize >= 4 && tex->blobData[0] == '2' && tex->blobData[1] == 'z') {
+            pixels = ImageDecoder_decodeToRgba(tex->blobData, tex->blobSize, true, &w, &h);
+        } else {
+            pixels = stbi_load_from_memory(tex->blobData, (int) tex->blobSize, &w, &h, &channels, 4);
+            pixelsFromStbi = (pixels != NULL);
+        }
     } else if (r->dataWinFile != NULL) {
         png = safeMalloc(tex->blobSize);
         if (png == NULL) return NULL;
@@ -169,31 +186,37 @@ static GCNTexturePage* GCNRenderer_ensurePage(GCNRenderer* r, uint32_t textureIn
             free(png);
             return NULL;
         }
-        pixels = stbi_load_from_memory(png, (int) tex->blobSize, &w, &h, &channels, 4);
+        if (tex->blobSize >= 4 && png[0] == '2' && png[1] == 'z') {
+            pixels = ImageDecoder_decodeToRgba(png, tex->blobSize, true, &w, &h);
+        } else {
+            pixels = stbi_load_from_memory(png, (int) tex->blobSize, &w, &h, &channels, 4);
+            pixelsFromStbi = (pixels != NULL);
+        }
         free(png);
     }
     if (pixels == NULL || w <= 0 || h <= 0) return NULL;
 
     uint32_t pw = (uint32_t) w;
     uint32_t ph = (uint32_t) h;
+    origW = pw; origH = ph;
 
     // Downscale oversized pages 2x until they fit (a 2048x2048 page becomes
     // 1024x1024 = 4MB - the max that fits MEM1 alongside the VM).
     while (pw > GCN_MAX_PAGE_DIM || ph > GCN_MAX_PAGE_DIM) {
         uint32_t nw = pw / 2, nh = ph / 2;
         uint8_t* half = safeMalloc(nw * nh * 4);
-        if (half == NULL) { stbi_image_free(pixels); return NULL; }
+        if (half == NULL) { GCN_freePixels(pixels, pixelsFromStbi); return NULL; }
         for (uint32_t y = 0; y < nh; ++y) {
             const uint32_t* srcRow = (const uint32_t*) (pixels + (y * 2) * pw * 4);
             uint32_t* dstRow = (uint32_t*) (half + y * nw * 4);
             for (uint32_t x = 0; x < nw; ++x) dstRow[x] = srcRow[x * 2];
         }
-        stbi_image_free(pixels);
+        GCN_freePixels(pixels, pixelsFromStbi);
         pixels = half;
         pw = nw; ph = nh;
     }
     if ((pw & 31) != 0 || (ph & 31) != 0) {
-        stbi_image_free(pixels);
+        GCN_freePixels(pixels, pixelsFromStbi);
         return NULL;
     }
 
@@ -204,23 +227,29 @@ static GCNTexturePage* GCNRenderer_ensurePage(GCNRenderer* r, uint32_t textureIn
         r->pageBuffers[victim] = memalign(32, needed);
         if (r->pageBuffers[victim] == NULL) {
             r->pageBufferSizes[victim] = 0;
-            stbi_image_free(pixels);
+            GCN_freePixels(pixels, pixelsFromStbi);
             return NULL;
         }
         r->pageBufferSizes[victim] = needed;
     }
 
     GCNRenderer_swizzleRGBA8(pixels, pw, ph, r->pageBuffers[victim]);
-    stbi_image_free(pixels);
+    GCN_freePixels(pixels, pixelsFromStbi);
 
     DCFlushRange(r->pageBuffers[victim], needed);
     GX_InitTexObj(&page->texObj, r->pageBuffers[victim], pw, ph, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObjLOD(&page->texObj, GX_NEAR, GX_NEAR, 0.0f, 0.0f, 0.0f, 0, 0, GX_ANISO_1);
     page->width = pw;
     page->height = ph;
+    page->scale = (float) origW / (float) pw;
     page->ownerTexture = textureIndex;
     page->ready = true;
     page->lastUsedStamp = ++r->useStamp;
+    {
+        extern void GCN_bootlog(const char* fmt, ...);
+        GCN_bootlog("[FONTPAGE] page %u decoded %ux%u from %u-byte blob",
+            textureIndex, pw, ph, (unsigned) tex->blobSize);
+    }
     return page;
 }
 
@@ -329,10 +358,10 @@ static void GCNRenderer_drawSprite(Renderer* base, int32_t tpagIndex, float x, f
         r,
         tpag->texturePageId,
         w00x, w00y, w10x, w10y, w01x, w01y,
-        (float) tpag->sourceX / (float) page->width,
-        (float) tpag->sourceY / (float) page->height,
-        (float) (tpag->sourceX + tpag->sourceWidth) / (float) page->width,
-        (float) (tpag->sourceY + tpag->sourceHeight) / (float) page->height,
+        (float) tpag->sourceX / (float) (page->width * page->scale),
+        (float) tpag->sourceY / (float) (page->height * page->scale),
+        (float) (tpag->sourceX + tpag->sourceWidth) / (float) (page->width * page->scale),
+        (float) (tpag->sourceY + tpag->sourceHeight) / (float) (page->height * page->scale),
         color, color, base->drawAlpha * alpha, false
     );
 }
@@ -361,10 +390,10 @@ static void GCNRenderer_drawSpritePart(Renderer* base, int32_t tpagIndex, int32_
         r,
         tpag->texturePageId,
         g00x, g00y, g10x, g10y, g01x, g01y,
-        (float) (tpag->sourceX + srcOffX) / (float) page->width,
-        (float) (tpag->sourceY + srcOffY) / (float) page->height,
-        (float) (tpag->sourceX + srcOffX + srcW) / (float) page->width,
-        (float) (tpag->sourceY + srcOffY + srcH) / (float) page->height,
+        (float) (tpag->sourceX + srcOffX) / (float) (page->width * page->scale),
+        (float) (tpag->sourceY + srcOffY) / (float) (page->height * page->scale),
+        (float) (tpag->sourceX + srcOffX + srcW) / (float) (page->width * page->scale),
+        (float) (tpag->sourceY + srcOffY + srcH) / (float) (page->height * page->scale),
         color, color, base->drawAlpha * alpha, false
     );
 }
@@ -502,10 +531,10 @@ static void GCNRenderer_drawTextCommon(Renderer* base, const char* text, float x
                 r,
                 fontTpag->texturePageId,
                 w00x, w00y, w10x, w10y, w01x, w01y,
-                (float) (fontTpag->sourceX + glyph->sourceX) / (float) page->width,
-                (float) (fontTpag->sourceY + glyph->sourceY) / (float) page->height,
-                (float) (fontTpag->sourceX + glyph->sourceX + glyph->sourceWidth) / (float) page->width,
-                (float) (fontTpag->sourceY + glyph->sourceY + glyph->sourceHeight) / (float) page->height,
+                (float) (fontTpag->sourceX + glyph->sourceX) / (float) (page->width * page->scale),
+                (float) (fontTpag->sourceY + glyph->sourceY) / (float) (page->height * page->scale),
+                (float) (fontTpag->sourceX + glyph->sourceX + glyph->sourceWidth) / (float) (page->width * page->scale),
+                (float) (fontTpag->sourceY + glyph->sourceY + glyph->sourceHeight) / (float) (page->height * page->scale),
                 color, color, base->drawAlpha * alpha, false
             );
 
@@ -590,46 +619,34 @@ static void GCNRenderer_emitVertex(float x, float y, float u, float v, uint8_t c
 }
 
 static void GCNRenderer_renderCommands(GCNRenderer* r, uint32_t clearR, uint32_t clearG, uint32_t clearB, float clearA) {
-    GCNRenderer_lastDrawCall = "renderCommands";
-    GX_SetCopyClear((GXColor) { (uint8_t) clearR, (uint8_t) clearG, (uint8_t) clearB, (uint8_t) (clearA * 255.0f) }, GX_MAX_Z24);
-
+    GCNRenderer_lastDrawCall = "swrRender";
+    // SOFTWARE PATH: clear the XFB to black on CPU, then blit every quad
+    // directly. No GX involvement at all - same pixel path as the console
+    // text that provably reaches this TV.
+    u16* xfb = (u16*) GCN_getXfb(GCN_getXfbIndex());
+    GXRModeObj* rmode = GCN_getRMode();
+    uint32_t stride = rmode->fbWidth;
+    for (uint32_t yyy = 0; yyy < 480; ++yyy) {
+        u16* row = xfb + yyy * stride;
+        for (uint32_t xxx = 0; xxx < 640; xxx += 2) {
+            // pair layout: u16[2n]=(Y1<<8)|V, u16[2n+1]=(Y0<<8)|U
+            row[xxx] = (u16) ((16 << 8) | 0x80);
+            row[xxx + 1] = (u16) ((16 << 8) | 0x80);
+        }
+    }
+    GCNRenderer_statsCommands = r->commandCount;
     if (r->commandCount == 0) return;
 
     float scaleX = 640.0f / (float) r->frameW;
     float scaleY = 480.0f / (float) r->frameH;
     float scale = scaleX < scaleY ? scaleX : scaleY;
-    if (scale < 1.0f) scale = 1.0f;
     float targetW = (float) r->frameW * scale;
     float targetH = (float) r->frameH * scale;
     float offsetX = (640.0f - targetW) * 0.5f;
     float offsetY = (480.0f - targetH) * 0.5f;
 
-    Mtx44 projection;
-    guOrtho(projection, 0.0f, 480.0f, 0.0f, 640.0f, -1.0f, 1000.0f); // near=-1 so z=0 verts aren't clipped
-    GX_LoadProjectionMtx(projection, GX_ORTHOGRAPHIC);
-    GX_SetViewport(0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f);
-    GX_SetScissor((u32) offsetX, (u32) offsetY, (u32) targetW, (u32) targetH);
-
-    GCNRenderer_setCommonState(true);
-
-    int32_t currentTexture = INT32_MIN;
     for (uint32_t i = 0; i < r->commandCount; ++i) {
         GCNQuadCommand* command = &r->commands[i];
-        if (command->textureIndex != currentTexture) {
-            GX_DrawDone();
-            if (command->textureIndex < 0) {
-                GX_LoadTexObj(&r->whiteTexObj, GX_TEXMAP0);
-                currentTexture = command->textureIndex;
-            } else {
-                GCNTexturePage* page = GCNRenderer_ensurePage(r, (uint32_t) command->textureIndex);
-                if (page == NULL) {
-                    currentTexture = INT32_MIN;
-                    continue;
-                }
-                GX_LoadTexObj(&page->texObj, GX_TEXMAP0);
-                currentTexture = command->textureIndex;
-            }
-        }
 
         float p00x = offsetX + command->p00x * scale;
         float p00y = offsetY + command->p00y * scale;
@@ -637,33 +654,52 @@ static void GCNRenderer_renderCommands(GCNRenderer* r, uint32_t clearR, uint32_t
         float p10y = offsetY + command->p10y * scale;
         float p01x = offsetX + command->p01x * scale;
         float p01y = offsetY + command->p01y * scale;
-        float p11x = p10x + (p01x - p00x);
-        float p11y = p10y + (p01y - p00y);
 
-        // game space Y-down -> GX ortho Y-up flip
-        float y00 = 480.0f - p00y;
-        float y10 = 480.0f - p10y;
-        float y01 = 480.0f - p01y;
-        float y11 = 480.0f - p11y;
+        uint8_t mr = GCNRenderer_colorR(command->color0);
+        uint8_t mg = GCNRenderer_bgrG(command->color0);
+        uint8_t mb = GCNRenderer_bgrB(command->color0);
+        uint8_t ma = (uint8_t) (command->alpha * 255.0f);
+        (void) command->color1;
+        (void) command->gradient;
 
-        uint8_t r0 = GCNRenderer_colorR(command->color0);
-        uint8_t g0 = GCNRenderer_bgrG(command->color0);
-        uint8_t b0 = GCNRenderer_bgrB(command->color0);
-        uint8_t r1 = command->gradient ? GCNRenderer_colorR(command->color1) : r0;
-        uint8_t g1 = command->gradient ? GCNRenderer_bgrG(command->color1) : g0;
-        uint8_t b1 = command->gradient ? GCNRenderer_bgrB(command->color1) : b0;
-        uint8_t a = (uint8_t) (command->alpha * 255.0f);
+        const uint8_t* pageBuf = NULL;
+        uint32_t pageW = 0, pageH = 0;
+        if (command->textureIndex >= 0) {
+            GCNTexturePage* page = GCNRenderer_findResident(r, (uint32_t) command->textureIndex);
+            if (page == NULL) {
+                GCNRenderer_statsSkipped++;
+                // Try to load the page on the spot (render-time fetch):
+                page = GCNRenderer_ensurePage(r, (uint32_t) command->textureIndex);
+                if (page == NULL) { GCNRenderer_statsSkipped++; continue; }
+            }
+            for (uint32_t slot = 0; slot < GCN_RESIDENT_PAGES; ++slot) {
+                if (r->pages[slot].ready && r->pages[slot].ownerTexture == (uint32_t) command->textureIndex) {
+                    pageBuf = r->pageBuffers[slot];
+                    pageW = page->width;
+                    pageH = page->height;
+                    break;
+                }
+            }
+            if (pageBuf == NULL) { GCNRenderer_statsSkipped++; continue; }
+        }
+        GCNRenderer_statsBlitted++;
 
-        GX_Begin(GX_TRIANGLES, GX_VTXFMT0, GCN_VERTICES_PER_QUAD);
-            GCNRenderer_emitVertex(p00x, y00, command->u0, command->v0, r0, g0, b0, a);
-            GCNRenderer_emitVertex(p10x, y10, command->u1, command->v0, r1, g1, b1, a);
-            GCNRenderer_emitVertex(p01x, y01, command->u0, command->v1, r0, g0, b0, a);
-            GCNRenderer_emitVertex(p01x, y01, command->u0, command->v1, r0, g0, b0, a);
-            GCNRenderer_emitVertex(p10x, y10, command->u1, command->v0, r1, g1, b1, a);
-            GCNRenderer_emitVertex(p11x, y11, command->u1, command->v1, r1, g1, b1, a);
-        GX_End();
+        GCN_swr_blitQuad(xfb, stride, pageBuf, pageW, pageH,
+            p00x, p00y, p10x, p10y, p01x, p01y,
+            command->u0, command->v0, command->u1, command->v1,
+            mr, mg, mb, ma);
     }
-    GX_DrawDone();
+
+    // GUARANTEED-VISIBLE marker: a solid white square marching across the
+    // top edge, drawn through THIS SAME blitter. If it shows on TV, the
+    // pixel path works and any invisibility is in the game's draw calls.
+    static uint32_t swrMarkerX = 0;
+    swrMarkerX = (swrMarkerX + 4) % 600;
+    GCN_swr_blitQuad(xfb, stride, NULL, 0, 0,
+        (float) swrMarkerX, 4.0f, (float) swrMarkerX + 24.0f, 4.0f,
+        (float) swrMarkerX, 28.0f,
+        0.0f, 0.0f, 1.0f, 1.0f, 255, 255, 255, 255);
+
     r->commandCount = 0;
 }
 
@@ -793,8 +829,11 @@ static RendererVtable GCNRendererVtable = {
     .drawTiledPart = NULL,
 };
 
+static GCNRenderer* gGCNRendererInstance = NULL;
+
 Renderer* GCNRenderer_create(void) {
     GCNRenderer* r = safeCalloc(1, sizeof(GCNRenderer));
+    gGCNRendererInstance = r;
     r->base.vtable = &GCNRendererVtable;
     r->base.drawColor = 0xFFFFFF;
     r->base.drawAlpha = 1.0f;
@@ -816,3 +855,100 @@ bool GCNRenderer_openDataWinFile(Renderer* renderer, const char* dataWinPath) {
     setvbuf(r->dataWinFile, NULL, _IOFBF, 64u * 1024u);
     return true;
 }
+
+static GCNRenderer* GCNRenderer_getInstance(void) {
+    return gGCNRendererInstance;
+}
+
+// ===[ DEMO MODE: solid-quad render test (Dolphin, no SD needed) ]==========
+GCNQuadCommand* GCNRenderer_demoCommands(void) {
+    static GCNQuadCommand demo[4];
+    return demo;
+}
+
+uint32_t GCNRenderer_demoBuildFrame(GCNQuadCommand* cmds, uint32_t frame) {
+    // quad 0: full-screen dark backdrop
+    memset(&cmds[0], 0, sizeof(GCNQuadCommand));
+    cmds[0].textureIndex = -1;
+    cmds[0].p00x = 0; cmds[0].p00y = 0;
+    cmds[0].p10x = 640; cmds[0].p10y = 0;
+    cmds[0].p01x = 0; cmds[0].p01y = 480;
+    cmds[0].color0 = 0x404040; // dark grey (BGR)
+    cmds[0].alpha = 1.0f;
+    // quad 1: red square moving right
+    float x = (float) ((frame * 3) % 600);
+    memset(&cmds[1], 0, sizeof(GCNQuadCommand));
+    cmds[1].textureIndex = -1;
+    cmds[1].p00x = x; cmds[1].p00y = 100;
+    cmds[1].p10x = x + 60; cmds[1].p10y = 100;
+    cmds[1].p01x = x; cmds[1].p01y = 160;
+    cmds[1].color0 = 0x0000FF; // red in BGR
+    cmds[1].alpha = 1.0f;
+    // quad 2: green square moving left
+    float y = 200 + (float) ((frame * 2) % 200);
+    memset(&cmds[2], 0, sizeof(GCNQuadCommand));
+    cmds[2].textureIndex = -1;
+    cmds[2].p00x = 200; cmds[2].p00y = y;
+    cmds[2].p10x = 300; cmds[2].p10y = y;
+    cmds[2].p01x = 200; cmds[2].p01y = y + 50;
+    cmds[2].color0 = 0x00FF00; // green
+    cmds[2].alpha = 1.0f;
+    // quad 3: white square
+    memset(&cmds[3], 0, sizeof(GCNQuadCommand));
+    cmds[3].textureIndex = -1;
+    cmds[3].p00x = 500; cmds[3].p00y = 300;
+    cmds[3].p10x = 560; cmds[3].p10y = 300;
+    cmds[3].p01x = 500; cmds[3].p01y = 360;
+    cmds[3].color0 = 0xFFFFFF;
+    cmds[3].alpha = 1.0f;
+    return 4;
+}
+
+// Embedded 64x64 RGBA8 checkerboard to validate the texture sampler path.
+static const uint8_t* demoTextureQuad = NULL;
+
+void GCNRenderer_renderDemoFrame(GCNQuadCommand* cmds, uint32_t count) {
+    GCNRenderer* r = GCNRenderer_getInstance();
+    if (r == NULL) {
+        // Demo path runs before the game creates its renderer - make one.
+        r = (GCNRenderer*) GCNRenderer_create();
+        r->frameW = 640;
+        r->frameH = 480;
+        r->viewX = 0; r->viewY = 0; r->viewW = 640; r->viewH = 480;
+        r->portX = 0; r->portY = 0; r->portW = 640; r->portH = 480;
+        r->viewScaleX = 1.0f; r->viewScaleY = 1.0f;
+        r->commandCount = 0;
+    }
+    r->commands[0] = cmds[0];
+    r->commands[1] = cmds[1];
+    r->commands[2] = cmds[2];
+    r->commands[3] = cmds[3];
+    r->commandCount = count;
+    // route through the same path the game uses:
+    r->base.vtable->endFrame(&r->base);
+    // then the TEXTURE TEST: a real sampled+blitted texture quad
+    static uint8_t testTex[64 * 64 * 2] __attribute__((aligned(32)));
+    static bool testTexInit = false;
+    if (!testTexInit) {
+        uint8_t rgba[64 * 64 * 4];
+        for (uint32_t y = 0; y < 64; ++y) {
+            for (uint32_t x = 0; x < 64; ++x) {
+                uint8_t* px = &rgba[(y * 64 + x) * 4];
+                if ((x >> 3) & 1) { px[0] = 255; px[1] = 64; px[2] = 64; px[3] = 255; }
+                else              { px[0] = 64; px[1] = 64; px[2] = 255; px[3] = 255; }
+            }
+        }
+        GCNRenderer_swizzleRGBA8(rgba, 64, 64, testTex);
+        DCFlushRange(testTex, sizeof(testTex));
+        testTexInit = true;
+    }
+    {
+        u16* xf = (u16*) GCN_getXfb(GCN_getXfbIndex());
+        GXRModeObj* rmode = GCN_getRMode();
+        GCN_swr_blitQuad(xf, rmode->fbWidth, testTex, 64, 64,
+            500.0f, 300.0f, 564.0f, 300.0f, 500.0f, 364.0f,
+            0.0f, 0.0f, 1.0f, 1.0f, 255, 255, 255, 255);
+    }
+}
+
+

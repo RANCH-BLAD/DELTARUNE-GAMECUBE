@@ -46,9 +46,23 @@ static bool GCNFileSystem_fileExists(FileSystem* fs, const char* relativePath) {
     return exists;
 }
 
+// Set to true by readFileText when the returned pointer is a static view
+// (ramfs blob) that the caller must NOT free.
+bool gGCN_lastReadWasStatic = false;
+
 static char* GCNFileSystem_readFileText(FileSystem* fs, const char* relativePath) {
     char* fullPath = GCNFileSystem_buildFullPath((GCNFileSystem*) fs, relativePath);
     if (fullPath == NULL) return NULL;
+
+    // RAM MODE: any "ram:..." file IS the decompressed data.win. Return a
+    // zero-copy static view (caller marked contentIsStatic, never frees).
+    if (strncmp(fullPath, "ram:", 4) == 0) {
+        extern uint8_t* GCN_ramfs_data(void);
+        extern bool gGCN_lastReadWasStatic;
+        free(fullPath);
+        gGCN_lastReadWasStatic = true;
+        return (char*) GCN_ramfs_data();
+    }
 
     FILE* file = fopen(fullPath, "rb");
     if (file == NULL) {
@@ -57,7 +71,7 @@ static char* GCNFileSystem_readFileText(FileSystem* fs, const char* relativePath
         return NULL;
     }
     // Big read buffer: SD reads are slow sector-sized operations on GC.
-    setvbuf(file, NULL, _IOFBF, 32u * 1024u);
+    setvbuf(file, NULL, _IOFBF, 8u * 1024u);
 
     fseek(file, 0, SEEK_END);
     long size = ftell(file);
@@ -86,7 +100,7 @@ static bool GCNFileSystem_writeFileText(FileSystem* fs, const char* relativePath
         free(fullPath);
         return false;
     }
-    setvbuf(file, NULL, _IOFBF, 32u * 1024u);
+    setvbuf(file, NULL, _IOFBF, 8u * 1024u);
 
     size_t length = strlen(contents);
     bool ok = fwrite(contents, 1, length, file) == length;
@@ -109,12 +123,24 @@ static bool GCNFileSystem_readFileBinary(FileSystem* fs, const char* relativePat
     char* fullPath = GCNFileSystem_buildFullPath((GCNFileSystem*) fs, relativePath);
     if (fullPath == NULL) return false;
 
+    // RAM MODE zero-copy (caller gets the decompressed blob; must not free)
+    if (strncmp(fullPath, "ram:", 4) == 0) {
+        extern uint8_t* GCN_ramfs_data(void);
+        extern uint32_t GCN_ramfs_size(void);
+        extern bool gGCN_lastReadWasStatic;
+        free(fullPath);
+        *outData = GCN_ramfs_data();
+        *outSize = (int32_t) GCN_ramfs_size();
+        gGCN_lastReadWasStatic = true;
+        return true;
+    }
+
     FILE* file = fopen(fullPath, "rb");
     if (file == NULL) {
         free(fullPath);
         return false;
     }
-    setvbuf(file, NULL, _IOFBF, 32u * 1024u);
+    setvbuf(file, NULL, _IOFBF, 8u * 1024u);
 
     fseek(file, 0, SEEK_END);
     long size = ftell(file);
@@ -145,7 +171,7 @@ static bool GCNFileSystem_writeFileBinary(FileSystem* fs, const char* relativePa
         free(fullPath);
         return false;
     }
-    setvbuf(file, NULL, _IOFBF, 32u * 1024u);
+    setvbuf(file, NULL, _IOFBF, 8u * 1024u);
 
     bool ok = fwrite(data, 1, (size_t) size, file) == (size_t) size;
     fclose(file);

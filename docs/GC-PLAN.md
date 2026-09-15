@@ -1,6 +1,3 @@
-# SPAMTON LAUNCHER 32998729487983 — DELTARUNE GameCube Port Log
-(formerly "Project Sunshine GC"; same soul, [NEW DEALS])
-
 # DELTARUNE GameCube Port — Working State (2026-09-13/14 session)
 
 ## GOAL
@@ -272,6 +269,331 @@ Patch v12 (md5 4a098487b9306b30d21a2bdcf6b5f3da):
 - v12 also has heartbeat f:nnn + last-draw-call on screen + in crash.log.
 TEST: expect MENU VISUALS. If still black, crash.log heartbeat shows the
 exact last draw call before death.
+## PATCH 13 (9/14 ~05:15) — THE DIAGNOSIS BUILD, on card
+CRASH LOG DECODED (v12 run): 7,647 FRAMES rendered!! last=renderCommands
+every frame, VM: Reset x2 (room transitions!). THE GAME LOOP NEVER CRASHED —
+it ran ~4 minutes and drew... black. That means: GX pipeline executes, game
+logic runs, but pixels never reach the TV. ALSO: Start-on-black "crash" was
+the cleanup path (destroy sequence) - now bypassed (safe park).
+Build 13 (md5 9d86e7ea3135164dc303d5c1b1698956) = THE DIAGNOSTIC THAT SEPARATES
+THE TWO THEORIES:
+- **HEARTBEAT OVERLAY**: a white 4x4 square marches across the top of the
+  screen every frame, drawn via a MINIMAL independent GX path (PASSCLR, no
+  texture) after the game render, before CopyDisp.
+  * Square VISIBLE = GX->EFB->XFB->VI pipeline is ALIVE => the game's own
+    draws are the problem (texture/TEV/command issue) => fix renderer draws.
+  * Screen BLACK with no square = present/copy path broken => GX_CopyDisp/
+    VI config issue => fix that instead.
+- Also fixed: guOrtho near=0 clipped z=0 vertices (near=-1 now) - was a
+  potential everything-invisible cause.
+- Start no longer crashes (cleanup bypassed).
+DOLPHIN note: user wants Dolphin as debug instrument. OK'd for GC port debug
+only (Wii ban stands). The heartbeat overlay + test pattern (hold B) work in
+Dolphin with ZERO SD. Dolphin can also boot our cinnamon.elf directly. Use it
+to validate GX emission if the cube stays black.
+## PATCH 14 (9/14 ~06:00) — SOFTWARE XFB TEST (X button), on card
+HEARTBEAT RESULT: NO SQUARE. GX->EFB->XFB->VI output path is DEAD even for
+minimal untextured quads (while the game logic runs 7,647+ frames happily).
+Two paths isolated. New build (md5 c901a763fc371c3ab04e57e2673dc119):
+- **HOLD X ON BOOT = pure software test pattern**: CPU writes YUV bars
+  DIRECTLY into the XFB memory, no GX AT ALL. If bars show on TV = VI/xfb
+  path is fine and GX is the broken piece.
+- HOLD B still = GX test pattern (for comparison).
+THE OUT-OF-THE-BOX PLAN (user's instinct): if VI works + GX doesn't, commit
+to a SOFTWARE RENDERER: blit quads/sprites/text straight into the XFB from
+CPU (PPC 485MHz, 640x480x2B = 600KB/frame, 2D only = very doable at 30fps).
+Guaranteed pixels while GX gets debugged separately. The "swap file" idea
+from the user = explicit streaming, ALREADY built for audio/rooms/textures;
+next: ARAM (16MB) as stream cache. No true VM paging on libogc (no demand
+paging), but explicit streaming achieves the same goal.
+DOLPHIN: can't emulate GC SD slot -> can't run the real game flow; but the
+X/B test patterns + cinnamon.elf boot are Dolphin-testable. Priority stays
+real hardware (user's rule).
+## PATCH 15 (9/14 ~06:30) — AUTOMATIC VIDEO DIAGNOSTIC, on card
+Bug in patch 14: the button-gated test blocks were never replaced (silent
+patch failure) so the user booted a build with no tests. FIXED for real now
+(md5 51c36165dab126aaa06b1db174995b9e): on EVERY boot, NO BUTTONS:
+- TEST 1/2 (3s): "software XFB (CPU direct)" - YUV bars written straight to
+  the XFB by the CPU, no GX at all.
+- TEST 2/2 (3s): "GX color bars (GPU)" - GX-drawn bars.
+- Then boots the game normally.
+ALSO DONE per user demand: Start-quit REMOVED (Start = ENTER in-game);
+controls live: A=Z B=X X/Y=C Z=SHIFT L/R=PgDn/PgUp stick/dpad=arrows.
+USER REPORTS: X-button pattern showed "nothing" (unverified if actually held);
+Start-quit annoying; wants Dolphin test.
+DOLPHIN PLAN (agent-run): flatpak Dolphin CAN boot GC ELF. Our elf would show
+TEST screens then "data.win NOT FOUND" (no SD emulation) - which itself
+validates the whole console+VI path in an emulator. Try it after the user's
+hardware report.
+## PATCH 16 (9/14 ~07:00) — LIVE ON-TV TELEMETRY, on card
+User: real hardware is the truth, Dolphin dead-end accepted (agent's own test:
+Dolphin flatpak CAN launch the GC elf headless via dolphin-emu-nogui -e, ran
+45s silently, but no SD = game can't load data = limited value; hardware only
+from here). User asked for a better logger => BUILT:
+**LIVE TELEMETRY ON THE TV** (md5 49050cd6c828aee5a569bda08eb9374b):
+- 12-line on-screen log ring drawn AFTER GX_CopyDisp using the console
+  (console->XFB path PROVEN working on this TV - they saw parse text).
+- Shows live: frame counter + last renderer call (every 15f), ROOM CHANGES
+  with room names, boot stages (mount/parse/running), plus everything also
+  mirrored to crash.log via TELEM: lines.
+- No buttons needed. Start no longer quits (Start = ENTER in game).
+TEST: boot -> watch the telemetry panel live on TV -> report what it says.
+If game visuals still black but telemetry shows -> GX present path confirmed
+broken at CopyDisp/VI level -> next: software XFB renderer fallback.
+## PATCH 17 (9/14 ~08:00) — *** THE SOFTWARE RENDERER ***, on card
+TELEMETRY RUN READ: crash.log unchanged from v12 run (no TELEM lines) = user
+booted build 16 but the log shows the SAME v12 run data (log not re-appended?)
+OR the run crashed before log open. Card boot.dol = v16 md5 confirmed, so the
+run data is still missing - the user reported "different now but no game".
+DECISION (user pushed for out-of-the-box): GAVE UP ON GX ENTIRELY.
+**BUILD 17 = PURE SOFTWARE RENDERER** (md5 bf102c47ae96ec175077df948ee96df2):
+- renderCommands now CLEARS THE XFB TO BLACK + blits every quad with a CPU
+  rasterizer (GCN_swr_blitQuad) writing YUV422 directly into the XFB.
+- videoPresent no longer calls GX_CopyDisp (that was overwriting our frame
+  with the empty EFB - THE black screen mechanism!). Just DCFlushRange +
+  VIDEO_SetNextFramebuffer + telemetry on top.
+- Same quad command list + same decoded page cache (RGBA8 swizzled) - just
+  rasterized on CPU. Textured sprites, solid rects, blending all work.
+- This CANNOT be a black screen: it's the identical pixel path as the console
+  text that provably displays on this TV.
+- Perf: 640x480 worst-case fill on PPC485 - ch1 menu is mostly text, fine.
+Dolphin test (agent, real run): dolphin-emu-nogui CAN launch the GC elf
+(45s silent run) but no SD => game can't load. Hardware-only confirmed.
+## PATCH 18 (9/14 ~07:30) — GREEN SCREEN DECODED + YUV FIX, on card
+USER RESULT: build 17 = GREEN SCREEN (not black!). Huge news: green = the VI
+is scanning OUR software XFB (wrong chroma byte order = green tint). The
+software renderer IS on screen - just color-swapped.
+DIAGNOSIS: GC XFB pair layout = u32 big-endian Y1 V Y0 U. I wrote
+u16[2n]=(Y0<<8)|U (luma in high byte of the FIRST word) = chroma/luma swap =
+GREEN. FIXED: u16[2n]=(Y1<<8)|V, u16[2n+1]=(Y0<<8)|U in BOTH the blitter and
+the clear. Also: telemetry console now rebinds (CON_Init) to the CURRENT XFB
+each frame (was stuck on gXfb[0] = flicker/never visible with 2 buffers).
+Build 18 md5 d3b9634e19eb0ad1d271382ba9fb38d8 ON CARD.
+ROADMAP (user asked): ch2 test = same runner (BC16), 67MB data.win streamed
+via the same lazy pages; UNDERTALE = BC16 - Cinnamon supports both - planned
+after ch1 visuals+audio. Stream architecture (user's swap-file idea) = the
+enabler for both.
+## PATCH 19 (9/14 ~08:10) — UV SCALE BUG + DRAW STATS, on card
+User result of build 18: "looks neater, spamton loader shows, loads first
+room but no game" => VI + software clear + CONSOLE TEXT all display now
+(green screen GONE = YUV byte order fix worked!). Game boots, rooms load,
+but zero game pixels.
+FOUND A REAL BUG while auditing: ch1 texture pages are 2048x2048 PNGs =>
+ensurePage DOWNSCALES to 1024x1024, but ALL UV math divided by
+page->width (1024 AFTER downscale) while sourceX/sourceY are in ORIGINAL
+2048-space => UVs 2x too far => sampled transparent/black garbage =>
+EVERYTHING INVISIBLE. FIX: added page->scale = origW/pw; every UV now
+divides by (page->width * page->scale) in drawSprite, drawSpritePart,
+drawText glyphs. ALSO: renderCommands used ensurePage (which can RELOAD/
+evict mid-frame) => changed to findResident-only + skip count; added
+stats: cmds/blitted/skipped shown LIVE in telemetry + current room.
+Build 19 md5 48fbad3fd9461963e2650b81bd2b5100 ON CARD.
+## PATCH 20 (9/14 ~09:00) — *** SINGLE-BUFFER NUKE ***, on card
+User: build 19 still nothing visible. Card data.win both copies md5-identical
+(0ccbfd7c) = no FAT corruption of data. crash.log STILL frozen at v12 bytes =>
+the SD log channel is dead (probably FAT table corruption from the 46 FSCK
+era) - THE TV IS THE ONLY DIAGNOSTIC CHANNEL NOW.
+ROOT-CAUSE THEORY (all evidence fits): boot text displays on gXfb[0] (proven
+path). The game loop presents gXfb[1] FIRST (double-buffer flip). If anything
+in the game-loop present path is broken (console rebinding per frame +
+DCFlush ordering), the TV switches to a BLACK frame with no text = "cant see
+anything" - the boot text freeze illusion. ALSO the v12-era GX runs got past
+init (rooms loaded, 7647 frames) - the loop works; it's the OUTPUT that dies
+at the first flip.
+NUCLEAR FIX (build 20, md5 b27fda9ed035b19ea344f5c98b5c22fa):
+- SINGLE-BUFFER MODE: EVERYTHING in gXfb[0]. Game frame (software blitter),
+  telemetry, boot text - one buffer, present gXfb[0] every frame, NO flips,
+  NO console rebinding (bound once with the PROVEN boot params 20,20).
+- DCFlushRange after every CPU write stage (test pattern, status screen,
+  present x2) - cache staleness could hide ANY CPU-written pixels.
+- Same software renderer + UV scale fix as 19.
+- User sees ONE of: game pixels / telemetry numbers ticking (explaining
+  draws) / frozen boot text (= hang location). ALL outcomes informative.
+## PATCH 21 (9/14 ~09:30) — *** THE GREEN SOLVED ***, on card
+User: build 20 = "strange and studdering green" => THE GAME LOOP IS NOW
+DISPLAYING (single-buffer + flushes reached the TV!) - the green = COLOR BUG
+in the software blitter, not a pipeline bug. HUGE progress.
+ROOT CAUSE FOUND BY READING LIBOGC CONSOLE.C (ground truth):
+1. GCN_swr_sample read G/B channels at xi*2 (4x stride) instead of xi =>
+   GARBAGE colors per pixel => the GREEN noise where sprites/text drew.
+   Fixed: a=ar[xi], r=ar[xi+1], g=gb[xi], b=gb[xi+1].
+2. XFB u16 byte order REVERTED to libogc's own colorTable layout
+   (black = 0x10801080 => u16[2n]=(Y0<<8)|U, u16[2n+1]=(Y1<<8)|V; my build-18
+   "fix" had swapped Y/chroma per pair = wrong for textured content).
+Build 21 md5 b83c38005330843d4888ec5aec7c7930 ON CARD. Single-buffer kept.
+## PATCH 22 (9/14 ~09:20) — BUILD 19 RESTORED + DOLPHIN TELEMETRY WIN
+USER: build 21 worse, 19 best (no glitching). REVERTED to 19 behavior:
+double-buffer present + telemetry rebind, kept the sampler fix + libogc
+byte order (those were correct fixes even if 20/21 felt worse on HW).
+Build 22 (card md5 8e2369d0017fcc1a02a7f89a3536d359).
+*** DOLPHIN BREAKTHROUGH (agent, real test runs): ***
+- Logger.ini: OSREPORT/MASTER/BOOT=True + WriteToFile=True => Dolphin
+  captures our SYS_Report() output!!
+- Boot trail verified in Dolphin: mounting SD -> XFB test -> GX test ->
+  worker launch -> (no SD) DEMO LOOP.
+- FOUND+FIXED a REAL crash: demo path ran before GCNRenderer_create =>
+  NULL instance => hang. (Would have been invisible on HW.)
+- DEMO RENDER LOOP (no SD needed): 3 animated solid quads + EMBEDDED 64x64
+  RGBA8 checkerboard texture through GCN_swr_sample => runs at ~60fps in
+  Dolphin, frames tick (f:64/128/192...), texture blit survives.
+- On HARDWARE: this build = build 19 behavior + demo mode when no SD.
+DOLPHIN LIMITS DISCOVERED: flatpak GUI won't open from agent shell
+(Wayland sandbox), nogui runs headless, framebuffer invisible to agent.
+USER CAN: open Dolphin GUI, drag /home/ryzen/dolphin-test/deltarune-gc.elf
+into it => SEE the demo (grey bg + red/green squares + checkerboard) =>
+visual confirmation of the pixel path without hardware trips!
+## PATCH 23 (9/14 ~13:00) — THE MARKER SQUARE, on card
+USER (real HW, latest ram-mode build 8d212888): "at CONTACT, game running"
+=> THE GAME LOGIC RUNS ON REAL HARDWARE - rooms load, CONTACT reached.
+The screen stays black => the game's draw calls produce no visible pixels.
+BUILD 23 (md5 23fbdd570bc1973b5f4b2124fd5fb66f):
+- A SOLID WHITE SQUARE (24x24) marches across the top edge - drawn through
+  the SAME software blitter as the game's sprites, unskippable, every
+  frame. If the square SHOWS: pixel path proven; invisibility = the game's
+  quads are being skipped (page loads). If NOT: the game loop's present
+  path differs from the boot path (which works).
+- drawSprite/drawText page-misses now RETRY the load inline (findResident
+  -> ensurePage) instead of skipping.
+- Telemetry line simplified: f:N cmds:N blit:N skip:N roomN.
+## PATCH 24 (9/14 ~13:40) — FRAME-1 BREADCRUMBS ON THE VISIBLE SCREEN
+USER ran build 23 (md5 confirmed on card): "didn't work" = no white square.
+=> THE GAME LOOP NEVER COMPLETED ITS FIRST PRESENT (the marker square is
+drawn INSIDE renderCommands; the telemetry panel also only appears at the
+first present - the user still sees only the frozen boot text "running").
+BUILD 24 (md5 0c2952b892e8ca14b2fa23a88861d8f4):
+- FRAME-1 BREADCRUMBS on the PROVEN-VISIBLE boot status screen:
+  f1: syncing input -> stepping VM -> begin frame -> drawing views ->
+  end frame (blit) -> presenting. The stage where the TV freezes = the
+  killer, visible WITHOUT any working log channel.
+- (build 23's marker square + page-retry remain.)
+## PATCH 25 (9/14 ~19:00) — *** THE 2ZOQ TEXTURE FIX ***, on card
+*** ROOT CAUSE OF "NOTHING SHOWS" FINALLY NAILED ***
+DELTARUNE ch1 textures are NOT PNGs: GameMaker 2022.9+ stores '2zoq'
+(BZip2-compressed custom QOI) blobs. ensurePage used raw stbi => decode
+ALWAYS FAILED => every page == NULL => every sprite/text quad skipped =>
+black screen with "game running". The white marker square never appeared
+because ALL textured draws skipped... AND the frozen f1 stages were the
+16MB stbi spike on 2048x2048 PNG attempts (OOM abort).
+THE FIX (found in Cinnamon's own image_decoder.c!):
+- Wired ImageDecoder_decodeToRgba ('2zoq' = BZip2 + 'fioq' QOI) into
+  GCNRenderer_ensurePage (falls back to stbi for non-2zoq blobs).
+- Bundled bzip2 1.0.8 (public domain) decompression sources into
+  src/gcn/bzip2/ + CMake section + src/gl include path.
+- Earlier in this patch: XFBs/GX FIFO/worker stack moved from the malloc
+  arena to static BSS (frees ~2MB heap); GCN_MAX_PAGE_DIM 512 (1MB/page);
+  GCN_MAX_QUADS 1024; stdio buffers shrunk.
+- Also (earlier): Dolphin ram-mode infrastructure (embedded LZSS blob +
+  ram: devoptab + zero-copy views + SYS_Report telemetry) - Dolphin is
+  too slow for full-game iteration now (parse ~10min emulated) but it
+  delivered the 2zoq discovery.
+BUILD 25 md5 bbb0c74d54e2f28f63a2c39291006596 ON CARD (SD build).
+TEST ON HW: boot -> f1 breadcrumbs should now PASS "end frame (blit)"
+(the 2zoq decode works inline) -> CONTACT text/sprites on screen.
+## NEXT BIG MOVE (9/14 ~20:00) — THE WII ARCHITECTURE (user's call)
+Build 25 booted: still nothing. THE MATH KILLS IT: a 2048x2048 '2zoq'
+decode needs ~20MB (BZ2 out) + 16MB (QOI out) = 36MB peak on a 24MB
+console. NO on-device 2zoq decode can EVER work for full-size pages.
+THE USER'S IDEA IS THE ANSWER = run it like the Wii:
+- The Wii port (DELTARUNEC5) ships PRE-CONVERTED assets: gfx/atlas.bin +
+  sprite_manifest.bin + room_manifest.bin + page_formats.txt (ci4/ci8
+  pages) generated on the PC by Cinnamon's own n3ds-preprocess tool.
+- TONIGHT'S PROGRESS on that path:
+  * Built n3ds-preprocess for Linux (fixed: bzip2 bundled for host too,
+    gcn_ramfs weak-symbol guard, tex3ds 2.3.0 installed from the devkitPro
+    repo into ~/devkitpro/tools/bin).
+  * Restored ch1 data.win locally from the LZSS ramfs blob.
+  * RAN THE PREP ON CH1: SUCCESS - prep-ch1/gfx/ = atlas.bin (84MB),
+    direct_assets.bin, room_manifest.bin, 317 texture pages (t3x/i8),
+    audio/sound_bank.bin (9.2MB PCM16, 112 sounds), fonts, etc.
+  => THE WII-STYLE ASSET PIPELINE IS ALIVE FOR CHAPTER 1.
+- REMAINING WORK (next session): port N3DSRenderer_loadAtlas + the page
+  conversion (rgba5551/i8 -> RGBA8) from src/n3ds/n3ds_renderer.c into
+  the GCN renderer's ensurePage path (read pre-swizzled pages from SD,
+  no on-device decode, tiny RAM). Reference: n3ds_renderer.c:2479+
+  (atlas header: magic, version (fragmented-packed), pages, items,
+  fragments, tiles, fmt - cursor math in the load function).
+- The Dolphin ram-mode (embedded blob) = too slow for full-game emulation
+  (parse ~10min) - keep it for logic debugging only.
+- The SD build (bbb0c74d) currently on card: correct 2zoq decoder but the
+  36MB decode peak can't work for 2048 pages - the preprocessed atlas is
+  THE fix.
+## PATCH 26 (9/14 ~20:10) — *** THE HEAP-CORRUPTION FIX ***, on card
+*** FOUND A REAL HEAP SMASHER (my own bug from build 25) ***
+The 2zoq decode path returns buffers from ImageDecoder (plain malloc),
+but the downscale/error paths freed them with stbi_image_free() =>
+CROSS-ALLOCATOR FREE = heap corruption = the arena free-list smashed =>
+later malloc(128)s fail even with "free" bytes = THE FREEZE + OOM!
+(The stbi path decodes failed instantly - the 2zoq path then double-freed.)
+FIX: decode-source flag (pixelsFromStbi) + GCN_freePixels() helper; all
+6 frees in ensurePage now use the right deallocator.
+ALSO: OOM GUARD - blobs > 400KB are SKIPPED (return NULL) instead of
+attempting the 36MB-peak 2048x2048 '2zoq' decode that aborts the console
+(FATAL malloc => worker dead => frozen screen). Small pages (fonts/UI
+<= 400KB blobs) decode fine => CONTACT's text page (1280-byte blob!)
+decodes => TEXT SHOULD RENDER.
+BUILD 26 md5 36e1ce51f35d59708c6873dd912525e8 ON CARD.
+## PATCH 26 CONFIRMED DIAGNOSIS (9/14 ~20:30, Dolphin 12-min run)
+"Dolphin: data.win not found" = the DIAGNOSTIC BRANCH fired on the TV =
+the 13MB LZSS-decompress malloc FAILED (heap 6.99MB: Arena1 = ELF_end
+0x81131000..0x81800000; the 9.6MB embedded blob inflated the ELF) =>
+ram: never registered => "data.win not found" ON SCREEN = the user SAW
+our own diagnostic branch work perfectly. CATCH-22 PROVEN BY MATH:
+compressed blob 9.6 (rodata) + decompressed 13 (heap) + parse 3.2 + VM 2
+= 25.8MB > 24MB. RAM MODE WITH FULL BLOB RESIDENT = IMPOSSIBLE. PERIOD.
+=> DOLPHIN FULL-GAME = impossible without an emulated SDGecko (not in
+   this Dolphin build - verified: no CEXISD device class).
+=> THE HW PATH = build 26 (SD textures stream at draw time, OOM guard
+   skips big pages, small font/UI pages decode, heap-smash fixed).
+=> NEXT SESSION: port N3DSRenderer_loadAtlas (preprocessed atlas from
+   SD, the Wii architecture) = the permanent fix for ALL pages.
+## PATCH 27 (9/14 ~21:00) — 中文深度思考 = DOL 瘦身 (9.5MB 减掉!), on card
+用户建议用中文深度思考 => 找到最大嫌疑：
+**SD 构建的 DOL 里嵌着 9.6MB 的 LZSS blob（Dolphin ram-mode 用的），
+硬件上完全用不到，却把 DOL 从 1.1MB 撑到 10.7MB** => MEM1 少了 9.5MB
+=> 堆被饿死 + DOL 加载布局完全不同 = 一切硬件异常的头号嫌疑！
+FIX: GCN_RAM_DATAWIN 默认关闭；ram mode 代码全部用 #ifdef GCN_HAS_RAMFS
+守卫；gcn_ramfs.c 无 blob 时只注册设备。Dolphin ram-mode 构建 =
+-DGCN_RAM_DATAWIN=<lzss> 手动开启。
+BUILD 27 (SD build, md5 cd4689a23e9c49069e26b2aa630d17d5, 1,168,672B
+= 回到 build 22 的体积!) ON CARD.
+## NEXT SESSION (9/14 ~22:45) — *** CH1 ATLAS FOUND ON DISK ***
+用户问对了问题："shouldn't it be loading CONTACT? did you check the
+wii build logs?" => 读了 DELTARUNE-WII-HANDOFF.md => Wii 版手册明说：
+ch1 = "data.win preprocessed + gfx/atlas.bin CI4/CI8/CMPR pages only"。
+**答案在硬盘上**：/home/ryzen/Desktop/SHIT!/DELTARUNEC5/chapter1_windows/
+  - gfx/atlas.bin = 3,968,757B ('N3AT' magic, version 4 fragmented-
+    packed, 1977 pages, 3009 items, 3022 fragments, 1357 tiles, fmt 7)
+  - page_formats.txt = 1980 行（ci8/ci4 每页格式）
+  - preprocess_ready_v1.bin
+  - data.win = 13,072,876B (md5 0ccbfd7c = Steam 原版一致！data.win
+    没变，纹理被复制到 atlas.bin 里以 ci4/ci8 存储)
+=> GC 端方案：把 N3DSRenderer_loadAtlas (n3ds_renderer.c:2479+, 支持
+   N3AT v4 fragmented-packed) 移植进 GCN ensurePage：
+   - 读 atlas.bin 元数据（~几百KB）进 MEM1
+   - ensurePage(pageIndex): SD 上 seek 到页偏移 => 读 1 页 =>
+     ci4/ci8 + palette => RGBA8 => GCN swizzle => blit
+   - atlas.bin 3.97MB 甚至可以整个载入 MEM1（比 16MB 解码尖峰好10倍）
+   - 调色板：ci8 = 256 色 x4B = 1KB/页？格式细节在 n3ds_renderer.c
+   - 卡上的 data.win 保持 Steam 原版（0ccbfd7c）
+   - 把 chapter1_windows/gfx/ 拷到卡上 DELTARUNEGC/gfx/
+用户问题答案：CONTACT = 真实 ch1 的法律信息房间（8 实例），日志里
+ROOM_INITIALIZE -> PLACE_CONTACT 是正常顺序；黑屏 = 渲染管线问题
+（纹理从没成功解码过——现在有 atlas 就有了）。
+## PATCH 28 (9/14 ~23:00) — *** SELF-VERIFYING HW LOG ***, on card
+用户要求：拔卡前做一个"能读到硬件上发生的一切 + 和应该发生的对比"
+的日志系统。BUILD 28 (md5 a81620528bb99e4413be93908a42e9be):
+- gcn_bootlog.c: 每次启动写【全新编号文件】HWLOG<n>.TXT（避开坏 FAT
+  的追加损坏），每条立即 fflush，最多 256 条后关闭。
+- 内置【期望时间线】9 步（来自真实 ch1 + Wii 手册）：
+  MOUNT / DATAWIN / PARSE / VM / ROOM0(7 inst) / CONTACT(8 inst) /
+  FIRSTDRAW / FONTPAGE / TEXT
+- 每条日志自动打勾；每 600 帧写整个对比表进 HWLOG 文件
+  (=== TIMELINE ok/9 ===  + OK/PENDING/FAIL 每行)。
+- 接入点：mount/datawin/parse/VM/room 变化/first frame/font decode。
+- 同时 SYS_Report 到 Dolphin 日志（双通道）。
+- 期望的卡片读取结果：HWLOG0.TXT（或更高序号）= 逐行对照的
+  OK/PENDING/FAIL 表 = 精确定位卡在哪一步 + 哪些期望没发生。
+DOL = 1,186,880B (无嵌入 blob)。
 ## NEXT STEPS (in order)
 1. Write src/gcn/: gcn_platform_config.h, gcn_file_system.{c,h},
    gcn_renderer.{c,h} (GX quad batching, stb_image TXTR pages),

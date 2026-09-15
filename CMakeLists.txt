@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(butterscotch C)
+project(butterscotch C ASM)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -71,6 +71,23 @@ if(PLATFORM STREQUAL "glfw" AND ENABLE_GLES)
 endif()
 
 add_executable(butterscotch ${SOURCES} ${PLATFORM_SOURCES})
+
+# GCN: bzip2 (for GameMaker 2022.9+ '2zoq' texture decoding)
+if(PLATFORM STREQUAL "gcn")
+    file(GLOB GCN_BZIP2_SOURCES src/gcn/bzip2/blocksort.c src/gcn/bzip2/huffman.c src/gcn/bzip2/crctable.c src/gcn/bzip2/decompress.c src/gcn/bzip2/randtable.c src/gcn/bzip2/bzlib.c)
+    target_sources(butterscotch PRIVATE ${GCN_BZIP2_SOURCES} ${CMAKE_SOURCE_DIR}/src/gl/image_decoder.c)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gcn/bzip2 ${CMAKE_SOURCE_DIR}/src/gl)
+endif()
+
+# GCN embedded data.win (RAM disk for Dolphin/no-SD mode)
+# OFF by default: the 9.6MB blob inflates the DOL and starves MEM1 on
+# hardware. Enable only for Dolphin ram-mode builds: -DGCN_RAM_DATAWIN=<file>
+if(PLATFORM STREQUAL "gcn" AND GCN_RAM_DATAWIN)
+    target_sources(butterscotch PRIVATE src/gcn/gcn_ramfs_data.S)
+    set_source_files_properties(src/gcn/gcn_ramfs_data.S PROPERTIES
+        COMPILE_OPTIONS "-DBIN_PATH=\"${GCN_RAM_DATAWIN}\"")
+    target_compile_definitions(butterscotch PRIVATE GCN_HAS_RAMFS=1)
+endif()
 target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # stb_ds
