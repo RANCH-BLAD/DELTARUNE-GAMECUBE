@@ -1,0 +1,13 @@
+=== SPAMTON LAUNCHER HWLOG 20 ===
+expected timeline:
+  [MOUNT] SD mounted (fatInitDefault ok)
+  [DATAWIN] chapter1_windows/data.win opened
+  [PARSE] all 31 chunks parsed (TXTR 30/31)
+  [VM] VM init: 11158 globals
+  [ROOM0] ROOM_INITIALIZE loaded, 7 instances
+  [CONTACT] PLACE_CONTACT loaded, 8 instances
+  [FIRSTDRAW] first frame blitted (cmds>0)
+  [FONTPAGE] font page decoded (page <= 2)
+  [TEXT] text pixels on screen
+---
+[BOOT] launcher build starting

@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 #define GCN_BOOTLOG_MAX 256
 static char g_bootlogPath[128];
@@ -34,6 +35,13 @@ static const ExpectStep kExpected[] = {
 #define EXPECT_COUNT (int)(sizeof(kExpected) / sizeof(kExpected[0]))
 static signed char kSeen[EXPECT_COUNT]; // 0=pending 1=ok -1=missing
 
+// GCN diagnostic counters (set by the runner/renderer, printed with the timeline)
+volatile uint32_t GCN_diag_drawEventsRun = 0;    // draw-event executions (any subtype)
+volatile uint32_t GCN_diag_drawCalls = 0;        // renderer draw* entry calls (sprite/text/rect)
+volatile uint32_t GCN_diag_vmWarnings = 0;       // VM warning line count
+volatile int32_t  GCN_diag_roomIndex = -1;       // current room index
+volatile int32_t  GCN_diag_roomChanges = 0;      // room transition count
+
 int GCN_bootlog_expectIndex(const char* tag) {
     for (int i = 0; i < EXPECT_COUNT; ++i) {
         if (strcmp(kExpected[i].tag, tag) == 0) return i;
@@ -47,9 +55,11 @@ void GCN_bootlog_mark(const char* tag, int ok) {
 }
 
 static void bootlog_scanSeq(void) {
-    DIR* dir = opendir("/apps/DELTARUNEGC");
+    const char* roots[] = { "/apps/DELTARUNEGC", "fat:/apps/DELTARUNEGC", "sd:/apps/DELTARUNEGC" };
     g_bootlogSeq = 0;
-    if (dir != NULL) {
+    for (int r = 0; r < 3; ++r) {
+        DIR* dir = opendir(roots[r]);
+        if (dir == NULL) continue;
         struct dirent* ent;
         while ((ent = readdir(dir)) != NULL) {
             int n = 0;
@@ -63,21 +73,22 @@ static void bootlog_scanSeq(void) {
 
 void GCN_bootlog_open(void) {
     bootlog_scanSeq();
+    const char* roots[] = { "/apps/DELTARUNEGC", "fat:/apps/DELTARUNEGC", "sd:/apps/DELTARUNEGC" };
+    for (int r = 0; r < 3; ++r) {
     for (int attempt = 0; attempt < 8; ++attempt) {
         snprintf(g_bootlogPath, sizeof(g_bootlogPath),
-            "/apps/DELTARUNEGC/HWLOG%d.TXT", g_bootlogSeq + attempt);
-        int fd = open(g_bootlogPath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (fd >= 0) {
-            close(fd);
-            g_bootlogFile = fopen(g_bootlogPath, "w");
-            if (g_bootlogFile != NULL) {
-                g_bootlogSeq += attempt;
-                break;
-            }
+            "%s/HWLOG%d.TXT", roots[r], g_bootlogSeq + attempt);
+        g_bootlogFile = fopen(g_bootlogPath, "w");
+        if (g_bootlogFile != NULL) {
+            g_bootlogSeq += attempt;
+            break;
         }
         g_bootlogFile = NULL;
     }
     if (g_bootlogFile != NULL) {
+        // ONE handle for the whole run: no reopen. HWLOG19/20 were header-only
+        // because the second fopen(path,"a") failed and left us with no handle
+        // (unbuffered writes lose nothing, so there is no reason to reopen).
         setvbuf(g_bootlogFile, NULL, _IONBF, 0);
         fprintf(g_bootlogFile, "=== SPAMTON LAUNCHER HWLOG %d ===\n", g_bootlogSeq);
         fprintf(g_bootlogFile, "expected timeline:\n");
@@ -85,11 +96,40 @@ void GCN_bootlog_open(void) {
             fprintf(g_bootlogFile, "  [%s] %s\n", kExpected[i].tag, kExpected[i].expect);
         }
         fprintf(g_bootlogFile, "---\n");
+        fprintf(g_bootlogFile, "[BOOT] launcher build starting\n");
         fflush(g_bootlogFile);
-        fclose(g_bootlogFile);
-        // reopen in append for the run
-        g_bootlogFile = fopen(g_bootlogPath, "a");
-        if (g_bootlogFile != NULL) setvbuf(g_bootlogFile, NULL, _IONBF, 0);
+        // BRIDGE: point stderr at the SAME open file so ALL runner/VM
+        // diagnostics land in the HWLOG alongside the timeline.
+        {
+            int logfd = fileno(g_bootlogFile);
+            if (logfd >= 0) {
+                dup2(logfd, fileno(stderr));
+                setvbuf(stderr, NULL, _IONBF, 0);
+            }
+        }
+        return; // opened!
+    } // attempt loop
+    } // roots loop
+    // last resort: root of the mount
+    snprintf(g_bootlogPath, sizeof(g_bootlogPath), "/HWLOG_ROOT.TXT");
+    g_bootlogFile = fopen(g_bootlogPath, "w");
+    if (g_bootlogFile != NULL) {
+        setvbuf(g_bootlogFile, NULL, _IONBF, 0);
+        fprintf(g_bootlogFile, "=== SPAMTON LAUNCHER HWLOG (root fallback) ===\n");
+        fprintf(g_bootlogFile, "expected timeline:\n");
+        for (int i = 0; i < EXPECT_COUNT; ++i) {
+            fprintf(g_bootlogFile, "  [%s] %s\n", kExpected[i].tag, kExpected[i].expect);
+        }
+        fprintf(g_bootlogFile, "---\n");
+        fprintf(g_bootlogFile, "[BOOT] launcher build starting\n");
+        fflush(g_bootlogFile);
+        {
+            int logfd = fileno(g_bootlogFile);
+            if (logfd >= 0) {
+                dup2(logfd, fileno(stderr));
+                setvbuf(stderr, NULL, _IONBF, 0);
+            }
+        }
     }
 }
 
@@ -146,3 +186,10 @@ int GCN_bootlog_compare(char* out, int outSize) {
 
 int GCN_bootlog_haveFile(void) { return g_bootlogFile != NULL; }
 const char* GCN_bootlog_path(void) { return g_bootlogPath; }
+void GCN_bootlog_close(void) {
+    if (g_bootlogFile != NULL) {
+        fflush(g_bootlogFile);
+        fclose(g_bootlogFile);
+        g_bootlogFile = NULL;
+    }
+}

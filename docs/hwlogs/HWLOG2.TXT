@@ -1,0 +1,29 @@
+=== SPAMTON LAUNCHER HWLOG 2 ===
+expected timeline:
+  [MOUNT] SD mounted (fatInitDefault ok)
+  [DATAWIN] chapter1_windows/data.win opened
+  [PARSE] all 31 chunks parsed (TXTR 30/31)
+  [VM] VM init: 11158 globals
+  [ROOM0] ROOM_INITIALIZE loaded, 7 instances
+  [CONTACT] PLACE_CONTACT loaded, 8 instances
+  [FIRSTDRAW] first frame blitted (cmds>0)
+  [FONTPAGE] font page decoded (page <= 2)
+  [TEXT] text pixels on screen
+---
+[BOOT] launcher build starting
+[MOUNT] fatInitDefault = OK
+[DATAWIN] opened /apps/DELTARUNEGC/chapter1_windows/data.win
+[BSPACK] pre-converted assets loaded from /apps/DELTARUNEGC/gfx-packed
+[PARSE] done: txtr=9 tpag=3009 rooms=147
+[VM] created, init first room...
+[PAYLOAD] room 0 (ROOM_INITIALIZE): objects=4 tiles=0 layers=2
+[PAYLOAD] room 1 (PLACE_CONTACT): objects=1 tiles=0 layers=2
+[ROOM1] PLACE_CONTACT inst=1
+[FIRSTDRAW] frame 1 presented (cmds=1 blit=1 skip=0)
+=== EXIT TIMELINE 5/9 (frame 538) ===
+OK MOUNT SD mounted (fatInitDefault ok)
+OK DATAWIN chapter1_windows/data.win opened
+OK PARSE all 31 chunks parsed (TXTR 30/31)
+OK VM VM init: 11158 globals
+PENDING ROOM0 ROOM_INITIALIZE loade
+SAFE TO POWER OFF

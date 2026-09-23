@@ -18,7 +18,9 @@ static void GCNFileSystem_bootLog(const char* message) {
 
 static char* GCNFileSystem_buildFullPath(GCNFileSystem* fs, const char* relativePath) {
     if (relativePath == NULL) return NULL;
-    if (strncmp(relativePath, "sd:/", 4) == 0) {
+    // Absolute paths (including device prefixes) are already resolved.
+    if (relativePath[0] == '/' || strncmp(relativePath, "sd:/", 4) == 0 ||
+        strncmp(relativePath, "fat:/", 5) == 0 || strncmp(relativePath, "ram:", 4) == 0) {
         return safeStrdup(relativePath);
     }
 
@@ -32,6 +34,16 @@ static char* GCNFileSystem_buildFullPath(GCNFileSystem* fs, const char* relative
     memcpy(fullPath + cursor, relativePath, relLen);
     fullPath[cursor + relLen] = '\0';
     return fullPath;
+}
+
+// Ensure basePath ends with a slash so GameMaker's working_directory + relative
+// file concatenation produces a valid path (e.g. "/apps/DELTARUNEGC/" + "lang/...").
+static void GCNFileSystem_ensureBasePathSlash(char* basePath, size_t size) {
+    size_t len = strlen(basePath);
+    if (len > 0 && len + 1 < size && basePath[len - 1] != '/') {
+        basePath[len] = '/';
+        basePath[len + 1] = '\0';
+    }
 }
 
 static char* GCNFileSystem_resolvePath(FileSystem* fs, const char* relativePath) {
@@ -194,6 +206,7 @@ static char gGCNBasePath[128] = "/apps/DELTARUNEGC";
 void GCNFileSystem_setBasePath(const char* basePath) {
     if (basePath != NULL && strlen(basePath) < sizeof(gGCNBasePath)) {
         snprintf(gGCNBasePath, sizeof(gGCNBasePath), "%s", basePath);
+        GCNFileSystem_ensureBasePathSlash(gGCNBasePath, sizeof(gGCNBasePath));
     }
 }
 
@@ -206,6 +219,8 @@ GCNFileSystem* GCNFileSystem_create(const char* basePath, const char* savePath) 
     fs->base.vtable = &GCNFileSystem_vtable;
     fs->basePath = safeStrdup(basePath != NULL ? basePath : gGCNBasePath);
     fs->savePath = safeStrdup(savePath != NULL ? savePath : gGCNBasePath);
+    GCNFileSystem_ensureBasePathSlash(fs->basePath, strlen(fs->basePath) + 1);
+    GCNFileSystem_ensureBasePathSlash(fs->savePath, strlen(fs->savePath) + 1);
     return fs;
 }
 

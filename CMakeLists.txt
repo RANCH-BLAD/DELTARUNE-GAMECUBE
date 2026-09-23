@@ -79,6 +79,13 @@ if(PLATFORM STREQUAL "gcn")
     target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gcn/bzip2 ${CMAKE_SOURCE_DIR}/src/gl)
 endif()
 
+# PC (glfw): same bundled bzip2 for image_decoder.c (GL_SOURCES glob already includes image_decoder.c)
+if(PLATFORM STREQUAL "glfw")
+    file(GLOB PC_BZIP2_SOURCES src/gcn/bzip2/blocksort.c src/gcn/bzip2/huffman.c src/gcn/bzip2/crctable.c src/gcn/bzip2/decompress.c src/gcn/bzip2/randtable.c src/gcn/bzip2/bzlib.c)
+    target_sources(butterscotch PRIVATE ${PC_BZIP2_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gcn/bzip2)
+endif()
+
 # GCN embedded data.win (RAM disk for Dolphin/no-SD mode)
 # OFF by default: the 9.6MB blob inflates the DOL and starves MEM1 on
 # hardware. Enable only for Dolphin ram-mode builds: -DGCN_RAM_DATAWIN=<file>

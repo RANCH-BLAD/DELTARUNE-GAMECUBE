@@ -9,7 +9,12 @@
 
 #include <gccore.h>
 #include <fat.h>
-#include <ogc/consol.h>
+// NOTE: <ogc/consol.h> and console_init() are DELIBERATELY NOT USED anywhere in
+// this file. console_init() registers __console_vipostcb as a VI post-retrace
+// callback in libogc; that callback memcpy()s the console shadow buffer over the
+// LIVE FRAMEBUFFER every vblank, which erased all game pixels (the black
+// screen). All on-screen text now goes through gcn_text_overlay.h instead.
+#include "gcn_text_overlay.h"
 #include <ogc/video.h>
 #include <ogc/video_types.h>
 #include <ogc/gx.h>
@@ -56,8 +61,9 @@ static void GCN_softwareTestPattern(void) {
         u16* row = xfb + y * gRMode->fbWidth;
         for (u32 x = 0; x < gRMode->fbWidth; x += 2) {
             u8 yy = ((x / 40) & 1) ? 0xFF : 0x10;
-            row[x + 0] = (u16) ((yy << 8) | 0x80); // Y0 U
-            row[x + 1] = (u16) ((yy << 8) | 0x80); // Y1 V
+            // BIG-ENDIAN: (Y<<8)|C stores as bytes [Y, C].
+            row[x + 0] = (u16) ((yy << 8) | 0x80); // [Y0, Cb]
+            row[x + 1] = (u16) ((yy << 8) | 0x80); // [Y1, Cr]
         }
     }
     DCFlushRange(gXfb[0], gRMode->fbWidth * gRMode->xfbHeight * 2);
@@ -92,16 +98,54 @@ static void GCN_logf(const char* fmt, ...) {
     SYS_Report("TELEM: %s\n", line); // Dolphin captures this in its log!
 }
 
+// ===[ TELEMETRY OVERLAY - SOFTWARE ONLY ]===
+// ROOT CAUSE (proven from libogc disassembly): console_init() installs
+// __console_vipostcb as a VI post-retrace callback, which memcpy()s its shadow
+// buffer (_console_buffer) over the CURRENT FRAMEBUFFER on EVERY vblank.
+// console_init must NEVER be used on a framebuffer we care about.
+// This draws straight into the XFB via the same proven CPU YUV write path.
+//
+// RENDER ORDER: the calibration swatch occupies y 0..7, so telemetry starts
+// clear of it. The game's own text draws near (110,80) - the telemetry band
+// sits well below that so it can never cover game content.
+#define GCN_TELEM_TOP 360
+// Re-enabled SAFE telemetry: a clean, fully-covered band near the BOTTOM of the
+// screen (y >= GCN_TELEM_TOP), drawn only when toggled ON (press START during play).
+// Every pixel in the band is written as a complete YUYV pair (no 0x0000 = green
+// gaps), and it is drawn LAST on the presented buffer so it never tears against
+// the game. Text uses the proven 5x7 overlay, uppercase, scale 2 => readable.
+static bool GCN_sTelemetryOn = false;
 static void GCN_telemetryRender(void) {
-    void* conXfb = gXfb[gXfbIndex];
-    console_init(conXfb, 0, 0, 640, 480, 640 * 2);
-    printf("\x1b[2;0H== SPAMTON LAUNCHER telemetry ==\n");
-    for (int i = 0; i < GCN_TELEM_LINES; ++i) {
-        int idx = (gTelemetryHead - GCN_TELEM_LINES + i + 2 * GCN_TELEM_LINES) % GCN_TELEM_LINES;
-        if (i >= GCN_TELEM_LINES - gTelemetryCount || gTelemetryCount == GCN_TELEM_LINES) {
-            printf("\x1b[%d;0H%s\n", 3 + i, gTelemetry[idx]);
+    if (!GCN_sTelemetryOn) return;
+    // Present into the buffer the game JUST finished (the one about to flip).
+    extern void* GCN_getXfb(u32 index);
+    extern u32 GCN_getXfbIndex(void);
+    extern GXRModeObj* GCN_getRMode(void);
+    GXRModeObj* rmode = GCN_getRMode();
+    u16* xfb = (u16*) GCN_getXfb(GCN_getXfbIndex()); // back buffer = next shown
+    const u32 stride = rmode->fbWidth;
+    // Fill the band fully black (complete pairs) from TELEM_TOP to bottom.
+    for (u32 yy = (u32) GCN_TELEM_TOP; yy < 480; ++yy) {
+        u16* row = xfb + yy * stride;
+        for (u32 xx = 0; xx < stride; xx += 2) {
+            row[xx]     = (u16) ((16 << 8) | 0x80);
+            row[xx + 1] = (u16) ((16 << 8) | 0x80);
         }
     }
+    // Readable status text: room, frame, blits. Uppercase-only font.
+    extern volatile uint32_t GCNRenderer_frameCounter, GCNRenderer_statsBlitted, GCNRenderer_statsSkipped;
+    extern volatile uint32_t GCN_diag_texturedBlits, GCN_diag_fastPath;
+    char line0[80], line1[80], line2[80];
+    snprintf(line0, sizeof(line0), "SPAMTON LAUNCHER - RANCHBLAD / K3 CLOUD");
+    snprintf(line1, sizeof(line1), "FRAME %u  BLIT %u  SKIP %u",
+        (unsigned) GCNRenderer_frameCounter, (unsigned) GCNRenderer_statsBlitted,
+        (unsigned) GCNRenderer_statsSkipped);
+    snprintf(line2, sizeof(line2), "TEXBLIT %u  FAST %u  (Z+START = SAVE LOG)",
+        (unsigned) GCN_diag_texturedBlits, (unsigned) GCN_diag_fastPath);
+    GCN_txt8_draw(xfb, stride, 8, GCN_TELEM_TOP + 8,  2, 0xFF, 0x10, line0);
+    GCN_txt8_draw(xfb, stride, 8, GCN_TELEM_TOP + 40, 2, 0xE0, 0x10, line1);
+    GCN_txt8_draw(xfb, stride, 8, GCN_TELEM_TOP + 72, 2, 0xE0, 0x10, line2);
+    DCFlushRange(xfb, stride * 480 * 2);
 }
 
 #include <malloc.h>
@@ -169,18 +213,34 @@ static void GCN_videoInit(void) {
     VIDEO_Flush();
     VIDEO_WaitVSync();
     if (gRMode->viTVMode & VI_NON_INTERLACE) VIDEO_WaitVSync();
-    gXfbIndex = 1;
+    gXfbIndex = 0; // SINGLE buffer: everything targets gXfb[0]
 }
 
-// Minimal text on the XFB for boot status (no console.h dependency dance).
+// Boot status text drawn with the SOFTWARE overlay (never console_init).
+// console_init installs a VI post-retrace callback that stamps its shadow
+// buffer over the live framebuffer every vblank - see the note above
+// GCN_telemetryRender. Using it here is what kept the game black.
+// Loading / boot screen. FULLY OWNS gXfb[0]: fills EVERY pixel black first so no
+// 0x0000 (green) memory survives, then draws all status/credit text. Called during
+// loading only (before the game loop / not while the game presents its own frames),
+// so it never tears against game pixels.
 static void GCN_drawStatusScreen(void) {
-    // Draw via console for simplicity: console renders into the active xfb.
-    static bool consoleReady = false;
-    if (!consoleReady) {
-        console_init(gXfb[0], 20, 20, gRMode->fbWidth, gRMode->xfbHeight, gRMode->fbWidth * VI_DISPLAY_PIX_SZ);
-        consoleReady = true;
+    u16* xfb = (u16*) gXfb[0];
+    const u32 stride = gRMode->fbWidth;
+    const u32 lines = gRMode->xfbHeight > 480 ? 480 : gRMode->xfbHeight;
+    // Black-clear every pixel as a complete YUYV pair (Y=16, Cb=128 / Y=16, Cr=128)
+    // so no zero (green) word remains on screen.
+    for (u32 yy = 0; yy < lines; ++yy) {
+        u16* row = xfb + yy * stride;
+        for (u32 xx = 0; xx < stride; xx += 2) {
+            row[xx]     = (u16) ((16 << 8) | 0x80);  // [Y=16, Cb=128]
+            row[xx + 1] = (u16) ((16 << 8) | 0x80);  // [Y=16, Cr=128]
+        }
     }
-    printf("\x1b[2;0HDELTARUNE GameCube [Cinnamon]\n\x1b[4;0H%s\n", gStatusLine);
+    GCN_txt8_draw(xfb, stride, 8, 8, 2, 0xFF, 0x10, "SPAMTON LAUNCHER");
+    GCN_txt8_draw(xfb, stride, 8, 8 + 36, 1, 0xC0, 0x80, "PROPERTY OF RANCHBLAD / CODED BY K3 CLOUD");
+    GCN_txt8_draw(xfb, stride, 8, 8 + 52, 1, 0xC0, 0x80, "DATA.WIN (C) TOBY FOX - NOT AFFILIATED");
+    GCN_txt8_draw(xfb, stride, 8, 8 + 72, 1, 0xFF, 0x10, gStatusLine);
     DCFlushRange(gXfb[0], gRMode->fbWidth * gRMode->xfbHeight * 2);
     VIDEO_SetNextFramebuffer(gXfb[0]);
     VIDEO_Flush();
@@ -225,13 +285,14 @@ static void GCN_drawHeartbeatOverlay(void) {
     GX_DrawDone();
 }
 
+// Main-thread presentation: the EXACT path the boot text proved works
+// (console bound once to gXfb[0], DCFlush, SetNext, Flush, WaitVSync).
+// The worker only RENDERS; the main thread owns every VI register write.
 static void GCN_videoPresent(void) {
-    DCFlushRange(gXfb[gXfbIndex], gRMode->fbWidth * gRMode->xfbHeight * 2);
-    GCN_telemetryRender();
-    VIDEO_SetNextFramebuffer(gXfb[gXfbIndex]);
+    DCFlushRange(gXfb[0], gRMode->fbWidth * gRMode->xfbHeight * 2);
+    VIDEO_SetNextFramebuffer(gXfb[0]);
     VIDEO_Flush();
     VIDEO_WaitVSync();
-    gXfbIndex ^= 1;
 }
 
 static void GCN_gxInit(void) {
@@ -278,14 +339,14 @@ static void GCN_parseProgress(const char* chunkName, int chunkIndex, int totalCh
 }
 
 extern void GCN_bootlog_open(void);
+static volatile int gFrameReady = 0;   // worker -> main: frame blitted
+static volatile int gStopPresent = 0;  // main -> worker: shutdown
 extern void GCN_bootlog(const char* fmt, ...);
 extern int GCN_bootlog_compare(char* out, int outSize);
 extern void GCN_bootlog_mark(const char* tag, int ok);
 
 static int GCN_gameMain(void) {
     GCN_logf("boot: mounting SD...");
-    GCN_bootlog_open();
-    GCN_bootlog("[BOOT] launcher build starting");
     {
         extern void SYS_STDIO_Report(bool use_stdout);
         SYS_STDIO_Report(true); // Dolphin: capture all stdout/stderr!
@@ -294,6 +355,9 @@ static int GCN_gameMain(void) {
     GCN_drawStatusScreen();
 
     int mountOk = fatInitDefault();
+    // Logger opens AFTER the mount - its file writes need libfat live!
+    GCN_bootlog_open();
+    GCN_bootlog("[BOOT] launcher build starting");
     GCN_bootlog("[MOUNT] fatInitDefault = %s", mountOk ? "OK" : "FAILED");
     if (!mountOk) {
 #if defined(GCN_HAS_RAMFS) && GCN_HAS_RAMFS
@@ -348,6 +412,19 @@ static int GCN_gameMain(void) {
             if (probe != NULL) {
                 GCNFileSystem_setBasePath(roots[r]);
                 GCN_bootlog("[DATAWIN] opened %s", dataWinPath);
+    {
+        extern bool BSP_load(const char* dirPath);
+    }
+    {
+        char bspDir[256];
+        snprintf(bspDir, sizeof(bspDir), "%s/gfx-packed", roots[r]);
+        extern bool BSP_load(const char* dirPath);
+        if (BSP_load(bspDir)) {
+            GCN_bootlog("[BSPACK] pre-converted assets loaded from %s", bspDir);
+        } else {
+            GCN_bootlog("[BSPACK] no packed assets at %s (legacy decode path)", bspDir);
+        }
+    }
                 extern void SYS_Report(char const* const, ...);
                 SYS_Report("DIAG: data.win via %s\n", roots[r]);
                 GCN_setStatus("data.win found!");
@@ -390,13 +467,16 @@ static int GCN_gameMain(void) {
         GCN_writeDiagFile(report);
 
         // Show the first lines ON SCREEN so we can see it without the card read:
-        static bool consoleReady = false;
-        if (!consoleReady) {
-            console_init(gXfb[0], 20, 20, gRMode->fbWidth, gRMode->xfbHeight, gRMode->fbWidth * VI_DISPLAY_PIX_SZ);
-            consoleReady = true;
+        // (software overlay - console_init would hijack the VI callback)
+        {
+            u16* xfb = (u16*) gXfb[0];
+            const u32 stride = gRMode->fbWidth;
+            GCN_txt8_draw(xfb, stride, 8, 8, 1, 0xFF, 0x10, "DELTARUNE GC - DATA.WIN NOT FOUND");
+            GCN_txt8_draw(xfb, stride, 8, 8 + 22, 1, 0xFF, 0x10, "SD REPORT:");
+            GCN_txt8_draw(xfb, stride, 8, 8 + 42, 1, 0xFF, 0x10, report);
+            GCN_txt8_draw(xfb, stride, 8, 8 + 220, 1, 0xFF, 0x10,
+                "(FULL REPORT ALSO WRITTEN TO DELTA_SD_REPORT.TXT ON SD)");
         }
-        printf("\x1b[2;0HDELTARUNE GC - data.win not found. SD report:\n%s\n", report);
-        printf("\x1b[20;0H(full report also written to DELTA_SD_REPORT.TXT on SD)\n");
         VIDEO_SetNextFramebuffer(gXfb[0]);
         VIDEO_Flush();
         while (1) { VIDEO_WaitVSync(); }
@@ -563,18 +643,80 @@ static int GCN_gameMain(void) {
             (buttonsHeld & PAD_BUTTON_UP) || stickY > 40);
         GCN_syncKey(runner->keyboard, &input.down, VK_DOWN,
             (buttonsHeld & PAD_BUTTON_DOWN) || stickY < -40);
-        GCN_syncKey(runner->keyboard, &input.a, 'Z', (buttonsHeld & PAD_BUTTON_A) != 0);
+        // CONFIRM: DELTARUNE's confirm is the Z / Enter key. Map ALL the
+        // natural GameCube confirm buttons onto 'Z' so the player can just
+        // press A. (A = the primary, B/X/Y also accepted so nothing is "dead".)
+        {
+            bool confirm = (buttonsHeld & (PAD_BUTTON_A | PAD_BUTTON_B |
+                                           PAD_BUTTON_X | PAD_BUTTON_Y)) != 0;
+            GCN_syncKey(runner->keyboard, &input.a, 'Z', confirm);
+            // Keep Enter live for menus/title screens that use vk_enter.
+            bool enter = (buttonsHeld & PAD_BUTTON_START) != 0;
+            GCN_syncKey(runner->keyboard, &input.start, VK_ENTER, enter);
+        }
+        // CANCEL: X key ('X'), and also the B button as a secondary cancel.
         GCN_syncKey(runner->keyboard, &input.b, 'X', (buttonsHeld & PAD_BUTTON_B) != 0);
+        // MENU / back: keep C and Y on their own keys for scripts that poll them.
         GCN_syncKey(runner->keyboard, &input.x, 'C', (buttonsHeld & PAD_BUTTON_X) != 0);
         GCN_syncKey(runner->keyboard, &input.y, 'C', (buttonsHeld & PAD_BUTTON_Y) != 0);
-        GCN_syncKey(runner->keyboard, &input.start, VK_ENTER, (buttonsHeld & PAD_BUTTON_START) != 0);
         GCN_syncKey(runner->keyboard, &input.z, VK_SHIFT, (buttonsHeld & PAD_TRIGGER_Z) != 0);
         GCN_syncKey(runner->keyboard, &input.l, VK_PAGEDOWN, (buttonsHeld & PAD_TRIGGER_L) != 0);
         GCN_syncKey(runner->keyboard, &input.r, VK_PAGEUP, (buttonsHeld & PAD_TRIGGER_R) != 0);
+        // TELEMETRY TOGGLE: L + R together toggles the readable on-screen status
+        // band (bottom of screen). Edge-triggered so holding it doesn't flicker.
+        {
+            static bool telemHeld = false;
+            bool telemNow = (buttonsHeld & PAD_TRIGGER_L) && (buttonsHeld & PAD_TRIGGER_R);
+            if (telemNow && !telemHeld) GCN_sTelemetryOn = !GCN_sTelemetryOn;
+            telemHeld = telemNow;
+        }
         (void) stickX; (void) stickY;
 
         GCN_F1_STAGE("f1: syncing input...");
         GCN_F1_STAGE("f1: stepping VM...");
+        // Z + START (both held) = graceful exit with log save.
+        if ((buttonsHeld & PAD_TRIGGER_Z) && (buttonsHeld & PAD_BUTTON_START)) {
+            char cmp[512];
+            extern int GCN_bootlog_compare(char* out, int outSize);
+            int ok = GCN_bootlog_compare(cmp, sizeof(cmp));
+            GCN_bootlog("=== EXIT TIMELINE %d/9 (frame %u) ===", ok, heartbeatFrame);
+            GCN_bootlog("%s", cmp);
+            {
+                extern volatile uint32_t GCN_diag_drawEventsRun;
+                extern volatile uint32_t GCN_diag_drawCalls;
+                extern volatile uint32_t GCN_diag_vmWarnings;
+                extern volatile int32_t GCN_diag_roomIndex;
+                extern volatile int32_t GCN_diag_roomChanges;
+                GCN_bootlog("[DIAG] drawEventsRun=%u drawCalls=%u vmWarnings=%u roomIndex=%d roomChanges=%d",
+                    (unsigned) GCN_diag_drawEventsRun, (unsigned) GCN_diag_drawCalls,
+                    (unsigned) GCN_diag_vmWarnings, (int) GCN_diag_roomIndex, (int) GCN_diag_roomChanges);
+            }
+            {
+                // TEXT-PIXEL EVIDENCE: texture-backed quads that REACHED the
+                // blitter (vs skipped), and the first UV rect + page size seen.
+                extern volatile uint32_t GCN_diag_texturedBlits;
+                extern volatile float GCN_diag_firstU, GCN_diag_firstV;
+                extern volatile float GCN_diag_firstU1, GCN_diag_firstV1;
+                extern volatile uint32_t GCN_diag_firstTexW, GCN_diag_firstTexH;
+                extern volatile uint32_t GCNRenderer_statsSkipped;
+                extern volatile const char* GCNRenderer_lastDrawCall;
+                GCN_bootlog("[TEXDIAG] texturedBlits=%u skipped=%u last=%s",
+                    (unsigned) GCN_diag_texturedBlits, (unsigned) GCNRenderer_statsSkipped,
+                    GCNRenderer_lastDrawCall ? GCNRenderer_lastDrawCall : "?");
+                GCN_bootlog("[TEXUV] u=%.4f v=%.4f u1=%.4f v1=%.4f page=%ux%u",
+                    (double) GCN_diag_firstU, (double) GCN_diag_firstV,
+                    (double) GCN_diag_firstU1, (double) GCN_diag_firstV1,
+                    (unsigned) GCN_diag_firstTexW, (unsigned) GCN_diag_firstTexH);
+            }
+            GCN_bootlog("SAFE TO POWER OFF");
+            extern void GCN_bootlog_close(void);
+            GCN_bootlog_close();
+            GCN_setStatus("LOG SAVED - SAFE TO POWER OFF");
+            // Present a clean, persistent exit screen. The game loop has stopped,
+            // so we own gXfb[0]; loop-present it so nothing tears the text.
+            GCN_drawStatusScreen();
+            break; // leave the game loop -> park below
+        }
         Runner_step(runner);
         static int lastRoomIdx = -1;
         if (runner->currentRoomIndex != lastRoomIdx) {
@@ -584,6 +726,12 @@ static int GCN_gameMain(void) {
             GCN_bootlog("[ROOM%d] %s inst=%u", (int) runner->currentRoomIndex,
                 runner->currentRoom && runner->currentRoom->name ? runner->currentRoom->name : "?",
                 (unsigned) (runner->currentRoom ? runner->currentRoom->gameObjectCount : 0));
+            {
+                extern volatile int32_t GCN_diag_roomIndex;
+                extern volatile int32_t GCN_diag_roomChanges;
+                GCN_diag_roomIndex = (int32_t) runner->currentRoomIndex;
+                GCN_diag_roomChanges++;
+            }
             lastRoomIdx = runner->currentRoomIndex;
         }
         runner->audioSystem->vtable->update(runner->audioSystem, 1.0f / 60.0f);
@@ -598,8 +746,17 @@ static int GCN_gameMain(void) {
         Runner_drawViews(runner, gameW, gameH, displayScaleX, displayScaleY, false);
         GCN_F1_STAGE("f1: end frame (blit)...");
         renderer->vtable->endFrame(renderer);
-        GCN_F1_STAGE("f1: presenting...");
-        GCN_videoPresent();
+        GCN_F1_STAGE("f1: handing frame to main...");
+        // Telemetry LAST: overlay the status band on the back buffer that the game
+        // just rendered, right before we hand it to the main thread to present.
+        // It only draws into y >= GCN_TELEM_TOP, so game content above is untouched.
+        GCN_telemetryRender();
+        // Worker renders into the BACK buffer, flushes it, then hands
+        // the frame to the main thread, which owns the VI flip.
+        DCFlushRange(gXfb[gXfbIndex], gRMode->fbWidth * gRMode->xfbHeight * 2);
+        gFrameReady = 1;
+        while (gFrameReady && !gStopPresent) { usleep(1000); }
+        gXfbIndex ^= 1; // swap back buffer for the next frame
         if (heartbeatFrame == 1) {
             extern volatile uint32_t GCNRenderer_statsCommands;
             extern volatile uint32_t GCNRenderer_statsBlitted;
@@ -620,14 +777,55 @@ static int GCN_gameMain(void) {
                 GCNRenderer_statsBlitted, GCNRenderer_statsSkipped,
                 (int) runner->currentRoomIndex);
             GCN_bootlog("%s", cmp);
+            {
+                // TEXT EVIDENCE at 600-frame cadence: survives even without Z+START.
+                extern volatile uint32_t GCN_diag_texturedBlits;
+                extern volatile uint32_t GCN_diag_fastPath;
+                extern volatile float GCN_diag_firstU, GCN_diag_firstV;
+                extern volatile float GCN_diag_firstU1, GCN_diag_firstV1;
+                extern volatile uint32_t GCN_diag_firstTexW, GCN_diag_firstTexH;
+                GCN_bootlog("[TEXDIAG] texturedBlits=%u skipped=%u fastPath=%u",
+                    (unsigned) GCN_diag_texturedBlits, (unsigned) GCNRenderer_statsSkipped,
+                    (unsigned) GCN_diag_fastPath);
+                GCN_bootlog("[TEXUV] u=%.4f v=%.4f u1=%.4f v1=%.4f page=%ux%u",
+                    (double) GCN_diag_firstU, (double) GCN_diag_firstV,
+                    (double) GCN_diag_firstU1, (double) GCN_diag_firstV1,
+                    (unsigned) GCN_diag_firstTexW, (unsigned) GCN_diag_firstTexH);
+                extern volatile uint32_t GCNRenderer_statsCmdsTotal;
+                GCN_bootlog("[TEXACC] cmdsTotal=%u", (unsigned) GCNRenderer_statsCmdsTotal);
+            }
+        }
+        // EARLY TEXT EVIDENCE: dump at frame 120 so a short run still proves it.
+        if (heartbeatFrame == 120) {
+            extern volatile uint32_t GCN_diag_texturedBlits;
+            extern volatile float GCN_diag_firstU, GCN_diag_firstV;
+            extern volatile float GCN_diag_firstU1, GCN_diag_firstV1;
+            extern volatile uint32_t GCN_diag_firstTexW, GCN_diag_firstTexH;
+            extern volatile uint32_t GCNRenderer_statsSkipped;
+            GCN_bootlog("[TEXDIAG@120] texturedBlits=%u skipped=%u",
+                (unsigned) GCN_diag_texturedBlits, (unsigned) GCNRenderer_statsSkipped);
+            GCN_bootlog("[TEXUV@120] u=%.4f v=%.4f u1=%.4f v1=%.4f page=%ux%u",
+                (double) GCN_diag_firstU, (double) GCN_diag_firstV,
+                (double) GCN_diag_firstU1, (double) GCN_diag_firstV1,
+                (unsigned) GCN_diag_firstTexW, (unsigned) GCN_diag_firstTexH);
         }
 
         RunnerKeyboard_beginFrame(runner->keyboard);
     }
 
-    // v13: cleanup caused crashes on Start - just report and park.
-    // (The user powers off anyway; a hang-free exit beats a crash.)
-    GCN_setStatus("exited - power off safe");
+    // Start button = graceful exit: write the final timeline + close the
+    // log so the card can be pulled right after the screen says SAFE.
+    {
+        char cmp[512];
+        extern int GCN_bootlog_compare(char* out, int outSize);
+        int ok = GCN_bootlog_compare(cmp, sizeof(cmp));
+        GCN_bootlog("=== EXIT TIMELINE %d/9 ===", ok);
+        GCN_bootlog("%s", cmp);
+        GCN_bootlog("SAFE TO POWER OFF");
+        extern void GCN_bootlog_close(void);
+        GCN_bootlog_close();
+    }
+    GCN_setStatus("exited - log saved, power off safe");
     GCN_drawStatusScreen();
     while (1) { usleep(1000); }
     return 0;
@@ -737,11 +935,22 @@ int main(int argc, char** argv) {
         extern void SYS_Report(char const* const, ...);
         SYS_Report("DIAG: tests done, launching worker\n");
     }
-    // Single-video-owner design: the worker owns ALL GX/VI access now.
-    // main() just blocks on the worker (a frozen screen means the worker
-    // printed its last stage before hanging - which is our diagnostic).
+    // MAIN-THREAD PRESENTATION LOOP: the worker renders frames into
+    // gXfb[0] and raises gFrameReady; the main thread presents each one
+    // using the exact register-write sequence the boot text proved.
+    // This splits the hardware roles: CPU rasterizes, main thread owns VI.
     while (!gWorkerDone) {
-        usleep(1000);
+        if (gFrameReady) {
+            u32 presentIdx = gXfbIndex; // worker's freshly-rendered buffer
+            GCN_telemetryRender();      // software overlay (bottom band only)
+            DCFlushRange(gXfb[presentIdx], gRMode->fbWidth * gRMode->xfbHeight * 2);
+            VIDEO_SetNextFramebuffer(gXfb[presentIdx]);
+            VIDEO_Flush();
+            VIDEO_WaitVSync();
+            gFrameReady = 0;
+        } else {
+            usleep(500);
+        }
     }
     LWP_JoinThread(gWorkerThread, NULL);
     return gWorkerResult;

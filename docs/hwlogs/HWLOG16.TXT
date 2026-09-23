@@ -1,0 +1,95 @@
+=== SPAMTON LAUNCHER HWLOG 16 ===
+expected timeline:
+  [MOUNT] SD mounted (fatInitDefault ok)
+  [DATAWIN] chapter1_windows/data.win opened
+  [PARSE] all 31 chunks parsed (TXTR 30/31)
+  [VM] VM init: 11158 globals
+  [ROOM0] ROOM_INITIALIZE loaded, 7 instances
+  [CONTACT] PLACE_CONTACT loaded, 8 instances
+  [FIRSTDRAW] first frame blitted (cmds>0)
+  [FONTPAGE] font page decoded (page <= 2)
+  [TEXT] text pixels on screen
+---
+[BOOT] launcher build starting
+[MOUNT] fatInitDefault = OK
+[DATAWIN] opened /apps/DELTARUNEGC/chapter1_windows/data.win
+[BSPACK] pre-converted assets loaded from /apps/DELTARUNEGC/gfx-packed
+[PARSE] done: txtr=9 tpag=3009 rooms=147
+[VM] created, init first room...
+[PAYLOAD] room 0 (ROOM_INITIALIZE): objects=4 tiles=0 layers=2
+[DRAWEV] #1 subtype=0 obj=obj_initializer2 code=1624 inst=100000
+[DRAWEV] #2 subtype=0 obj=obj_event_manager code=1646 inst=103515
+[DRAWEV] #3 subtype=0 obj=obj_event_manager_debug code=668 inst=103516
+[SETCOLOR] obj=obj_initializer2 type=2 int32=16777215 val32=00FFFFFF
+[DRAWEV] #4 subtype=0 obj=obj_time code=1607 inst=103547
+[DRAWEV] #5 subtype=0 obj=obj_gamecontroller code=1635 inst=100001
+[DRAWEV] #6 subtype=0 obj=obj_debugcontroller code=1640 inst=100002
+[ROOMLOADED] ROOM_INITIALIZE #0 instances=7
+[DRAWEV] #7 subtype=4 obj=obj_roomcontroller code=1645 inst=100003
+[DRAWEV] #8 subtype=1 obj=obj_time code=1609 inst=103547
+[DRAWEV] #9 subtype=1 obj=obj_gamecontroller code=1638 inst=100001
+[DRAWEV] #10 subtype=0 obj=obj_initializer2 code=1625 inst=100000
+[ROOMGOTO] pending=1 from=0
+[PAYLOAD] room 1 (PLACE_CONTACT): objects=1 tiles=0 layers=2
+[ROOMLOADED] PLACE_CONTACT #1 instances=8
+[ROOM1] PLACE_CONTACT inst=1
+[DRAWPASS] drawables=10 drawNormalSlot=40 room=PLACE_CONTACT
+[SETCOLOR] obj=DEVICE_CONTACT type=2 int32=0 val32=00000000
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[FIRSTDRAW] frame 1 presented (cmds=1 blit=1 skip=0)
+[DRAWPASS] drawables=11 drawNormalSlot=40 room=PLACE_CONTACT
+[SETCOLOR] obj=DEVICE_CONTACT type=2 int32=0 val32=00000000
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[SETCOLOR] obj=obj_writer type=2 int32=16777215 val32=00FFFFFF
+[DRAWTEXT] x=110.0 y=80.0 str="u"
+[BSPPAGE] page 7 from packed atlas 13x12
+[DRAWTEXT] x=111.0 y=80.0 str="u"
+[DRAWTEXT] x=109.0 y=80.0 str="u"
+[DRAWTEXT] x=110.0 y=81.0 str="u"
+[DRAWTEXT] x=110.0 y=79.0 str="u"
+[DRAWTEXT] x=111.0 y=81.0 str="u"
+[DRAWTEXT] x=109.0 y=79.0 str="u"
+[DRAWTEXT] x=109.0 y=81.0 str="u"
+[DRAWPASS] drawables=11 drawNormalSlot=40 room=PLACE_CONTACT
+[SETCOLOR] obj=DEVICE_CONTACT type=2 int32=0 val32=00000000
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[SETCOLOR] obj=obj_writer type=2 int32=16777215 val32=00FFFFFF
+[SETCOLOR] obj=DEVICE_CONTACT type=2 int32=0 val32=00000000
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[SETCOLOR] obj=obj_writer type=2 int32=16777215 val32=00FFFFFF
+[SETCOLOR] obj=DEVICE_CONTACT type=2 int32=0 val32=00000000
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[SETCOLOR] obj=obj_writer type=2 int32=16777215 val32=00FFFFFF
+[SETCOLOR] obj=DEVICE_CONTACT type=2 int32=0 val32=00000000
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[SETCOLOR] obj=obj_writer type=2 int32=16777215 val32=00FFFFFF
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] x1=-10.0 y1=-10.0 x2=999.0 y2=999.0 color=000000 alpha=0.40 outline=0 drawColor=000000 drawAlpha=0.40
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+[DRAWRECT] obj=DEVICE_CONTACT args=(-10.0,-10.0,999.0,999.0,0.0) drawColor=000000 drawAlpha=0.40
+=== TIMELINE 5/9 (frame 600 cmds=82 blit=47823 skip=0 room=1) ===
+OK MOUNT SD mounted (fatInitDefault ok)
+OK DATAWIN chapter1_windows/data.win opened
+OK PARSE all 31 chunks parsed (TXTR 30/31)
+OK VM VM init: 11158 globals
+PENDING ROOM0 ROOM_INITIALIZE loade
+=== EXIT TIMELINE 5/9 (frame 1183) ===
+OK MOUNT SD mounted (fatInitDefault ok)
+OK DATAWIN chapter1_windows/data.win opened
+OK PARSE all 31 chunks parsed (TXTR 30/31)
+OK VM VM init: 11158 globals
+PENDING ROOM0 ROOM_INITIALIZE loade
+[DIAG] drawEventsRun=10637 drawCalls=95547 vmWarnings=0 roomIndex=1 roomChanges=1
+SAFE TO POWER OFF

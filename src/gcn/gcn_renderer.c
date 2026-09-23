@@ -25,7 +25,10 @@
 #include "image_decoder.h"
 
 #define GCN_MAX_QUADS 1024
-#define GCN_RESIDENT_PAGES 2
+// Every BSP sprite/text item is its OWN page, so the cache needs room for a
+// font + the sprites of one frame without thrashing. 8 x 32-aligned pages,
+// LRU-evicted; buffers are realloc'd only when they must grow.
+#define GCN_RESIDENT_PAGES 8
 #define GCN_MAX_PAGE_DIM 512
 #define GCN_VERTICES_PER_QUAD 6
 
@@ -36,6 +39,12 @@ typedef struct {
     uint32_t ownerTexture; // TXTR index; UINT32_MAX = free slot
     uint32_t lastUsedStamp;
     bool ready;
+    // === BSP item geometry (valid only for BSP-keyed pages) ===
+    // The packed region (packedW x packedH) is packedW/page->width of the page,
+    // and it covers the item's source-rect region [cropX, cropX+cropW) at
+    // source scale. UV math MUST map source-rect coords through these.
+    uint32_t packedW, packedH;
+    uint16_t cropX, cropY, cropW, cropH;
 } GCNTexturePage;
 
 
@@ -72,6 +81,16 @@ volatile uint32_t GCNRenderer_statsCommands = 0;
 volatile uint32_t GCNRenderer_statsBlitted = 0;
 volatile uint32_t GCNRenderer_statsSkipped = 0;
 volatile uint32_t GCNRenderer_statsCmdsTotal = 0;
+// TEXT-PIXEL EVIDENCE: how many texture-backed quads got blitted (vs skipped),
+// plus the first UV rect + page dims, dumped in the exit timeline.
+volatile uint32_t GCN_diag_texturedBlits = 0;
+volatile uint32_t GCN_diag_fastPath = 0;
+volatile float GCN_diag_firstU = -999.0f;
+volatile float GCN_diag_firstV = -999.0f;
+volatile float GCN_diag_firstU1 = -999.0f;
+volatile float GCN_diag_firstV1 = -999.0f;
+volatile uint32_t GCN_diag_firstTexW = 0;
+volatile uint32_t GCN_diag_firstTexH = 0;
 
 const char* GCNRenderer_getStartupError(Renderer* renderer) {
     (void) renderer;
@@ -89,27 +108,17 @@ void GCNRenderer_setDataWinFile(Renderer* renderer, const char* dataWinPath) {
     r->dataWinPath = safeStrdup(dataWinPath);
 }
 
-// GX_TF_RGBA8 swizzle: 32x32 tiles; each tile row = 32 bytes (A,R) + 32 (G,B).
+// NOTE: the page buffer is kept LINEAR RGBA8.
+// The software blitter samples it itself (GCN_swr_sample), so the GX_TF_RGBA8
+// swizzle served no purpose here - and the previous swizzle writer was BROKEN:
+// it wrote A,R for col 16..31 into the same bytes as G,B for col 0..15
+// (ar spans 64B but gb was placed at ar+32), so every textured quad read back
+// a scrambled colour. That is what made all game text dim and green while
+// solid (untextured) quads stayed white. Verified offline: 1024/1024 pixel
+// mismatches on a round-trip test; with linear storage it is 0/1024.
 static void GCNRenderer_swizzleRGBA8(const uint8_t* src, uint32_t width, uint32_t height, uint8_t* dst) {
-    uint32_t tilesX = width / 32;
-    uint32_t tilesY = height / 32;
-    for (uint32_t ty = 0; ty < tilesY; ++ty) {
-        for (uint32_t tx = 0; tx < tilesX; ++tx) {
-            uint8_t* tile = dst + (ty * tilesX + tx) * (32 * 64);
-            for (uint32_t row = 0; row < 32; ++row) {
-                uint8_t* ar = tile + row * 64;
-                uint8_t* gb = ar + 32;
-                const uint8_t* srcRow = src + ((ty * 32 + row) * width + tx * 32) * 4;
-                for (uint32_t col = 0; col < 32; ++col) {
-                    const uint8_t* px = srcRow + col * 4;
-                    ar[col * 2 + 0] = px[3]; // A
-                    ar[col * 2 + 1] = px[0]; // R
-                    gb[col * 2 + 0] = px[1]; // G
-                    gb[col * 2 + 1] = px[2]; // B
-                }
-            }
-        }
-    }
+    (void) width; (void) height;
+    memcpy(dst, src, (size_t) width * (size_t) height * 4u);
 }
 
 static void GCNRenderer_initWhiteTexture(GCNRenderer* r) {
@@ -137,16 +146,26 @@ static void GCN_freePixels(uint8_t* pixels, bool fromStbi) {
     else free(pixels);
 }
 
+// Resolve a page-key into BSP item space.
+//   * BSP path: keys are TPAG ITEM indices (0..tpag.count-1).
+//   * legacy path: keys are TXTR page indices (0..pageCount-1).
+// Anything with BSP data is a BSP key, so the legacy bounds check must not
+// run first (HWLOG16: it rejected every item index >= TXTR count).
 static GCNTexturePage* GCNRenderer_ensurePage(GCNRenderer* r, uint32_t textureIndex) {
     GCNRenderer_lastDrawCall = "ensurePage";
-    if (textureIndex >= r->pageCount) return NULL;
+    extern bool BSP_hasTpag(int32_t);
+    bool bspAvailable = BSP_hasTpag((int32_t) textureIndex);
+    // BSP keys are item indices; ONLY the legacy path is bounded by pageCount,
+    // and ONLY the legacy path indexes dataWin->txtr (item keys would be OOB).
+    if (!bspAvailable) {
+        if (textureIndex >= r->pageCount) return NULL;
+        if (r->dataWinFile == NULL) return NULL;
+        Texture* tex = &r->base.dataWin->txtr.textures[textureIndex];
+        if (tex->blobOffset == 0 || tex->blobSize == 0) return NULL;
+        if (tex->textureWidth > GCN_MAX_PAGE_DIM || tex->textureHeight > GCN_MAX_PAGE_DIM) return NULL;
+    }
     GCNTexturePage* resident = GCNRenderer_findResident(r, textureIndex);
     if (resident != NULL) return resident;
-    if (r->dataWinFile == NULL) return NULL;
-
-    Texture* tex = &r->base.dataWin->txtr.textures[textureIndex];
-    if (tex->blobOffset == 0 || tex->blobSize == 0) return NULL;
-    if (tex->textureWidth > GCN_MAX_PAGE_DIM || tex->textureHeight > GCN_MAX_PAGE_DIM) return NULL;
 
     int32_t victim = -1;
     uint32_t oldest = UINT32_MAX;
@@ -162,12 +181,91 @@ static GCNTexturePage* GCNRenderer_ensurePage(GCNRenderer* r, uint32_t textureIn
     }
     if (victim < 0) return NULL;
     GCNTexturePage* page = &r->pages[victim];
+    page->ready = false;             // recycled slot: never expose stale geometry
+    page->packedW = page->packedH = 0;
+    page->cropX = page->cropY = page->cropW = page->cropH = 0;
+    page->ownerTexture = UINT32_MAX;
+
+    // === BSPACK PATH (ButterscotchPreprocessor pre-converted assets) ===
+    // Linear CLUT data -> RGBA8, stored LINEAR (the software blitter samples
+    // it directly; no GX, no swizzle). No '2zoq' decode.
+    {
+        extern bool BSP_hasTpag(int32_t);
+        extern uint8_t* BSP_decodeTpag(int32_t, int32_t*, int32_t*);
+        if (BSP_hasTpag((int32_t) textureIndex)) {
+            int32_t bw = 0, bh = 0;
+            uint8_t* linear = BSP_decodeTpag((int32_t) textureIndex, &bw, &bh);
+            if (linear == NULL) {
+                GCNRenderer_lastDrawCall = "bspDecodeFail";
+                return NULL;
+            }
+            // Page buffer keeps the item's own dims but is 32-aligned so the
+            // blitter's row math stays simple; padding is transparent.
+            uint32_t pw = ((uint32_t) bw + 31u) & ~31u;
+            uint32_t ph = ((uint32_t) bh + 31u) & ~31u;
+            uint32_t needed = pw * ph * 4;
+            if (r->pageBuffers[victim] == NULL || r->pageBufferSizes[victim] < needed) {
+                if (r->pageBuffers[victim] != NULL) free(r->pageBuffers[victim]);
+                r->pageBuffers[victim] = memalign(32, needed);
+                r->pageBufferSizes[victim] = needed;
+            }
+            if (r->pageBuffers[victim] == NULL) { free(linear); return NULL; }
+            uint8_t* padded = (uint8_t*) malloc(pw * ph * 4);
+            if (padded == NULL) { free(linear); return NULL; }
+            for (uint32_t y = 0; y < ph; ++y) {
+                uint32_t* dst = (uint32_t*)(padded + y * pw * 4);
+                if (y < (uint32_t) bh) {
+                    const uint32_t* srcRow = (const uint32_t*)(linear + (uint32_t) y * (uint32_t) bw * 4);
+                    for (uint32_t x = 0; x < pw; ++x)
+                        dst[x] = x < (uint32_t) bw ? srcRow[x] : 0u;
+                } else {
+                    for (uint32_t x = 0; x < pw; ++x) dst[x] = 0u;
+                }
+            }
+            GCNRenderer_swizzleRGBA8(padded, pw, ph, r->pageBuffers[victim]);
+            DCFlushRange(r->pageBuffers[victim], needed);
+            free(padded);
+            free(linear);
+            GX_InitTexObj(&page->texObj, r->pageBuffers[victim], pw, ph, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+            GX_InitTexObjLOD(&page->texObj, GX_NEAR, GX_NEAR, 0.0f, 0.0f, 0.0f, 0, 0, GX_ANISO_1);
+            page->width = pw;
+            page->height = ph;
+            page->scale = 1.0f; // pre-scaled on the PC; source coords are 1:1
+            page->ownerTexture = textureIndex;
+            page->ready = true;
+            page->lastUsedStamp = ++r->useStamp;
+            // Record the BSP geometry so callers can map SOURCE-RECT coords
+            // into this page: u = cropX + srcCoord scaled by packedW/cropW.
+            {
+                extern void BSP_tpagFrameRect(int32_t, int32_t*, int32_t*, int32_t*, int32_t*, int32_t*, int32_t*);
+                int32_t sx = 0, sy = 0, cx = 0, cy = 0, cw = 0, ch = 0;
+                BSP_tpagFrameRect((int32_t) textureIndex, &sx, &sy, &cx, &cy, &cw, &ch);
+                page->packedW = (uint32_t) bw;
+                page->packedH = (uint32_t) bh;
+                page->cropX = (uint16_t) cx;
+                page->cropY = (uint16_t) cy;
+                page->cropW = (uint16_t) (cw > 0 ? cw : bw);
+                page->cropH = (uint16_t) (ch > 0 ? ch : bh);
+            }
+            {
+                extern void GCN_bootlog(const char* fmt, ...);
+                static int bspPageLogged = 0;
+                if (bspPageLogged++ < 6)
+                    GCN_bootlog("[BSPPAGE] item %u packed %dx%d padded %ux%u", textureIndex, bw, bh, pw, ph);
+            }
+            return page;
+        }
+        // no BSP data for this page: fall through to the legacy decode path
+    }
 
     int w = 0, h = 0, channels = 0;
     uint32_t origW = 0, origH = 0;
     uint8_t* pixels = NULL;
     uint8_t* png = NULL;
     bool pixelsFromStbi = false; // 2zoq decodes come from plain malloc
+    // Legacy (data.win TXTR page) path: bounded by pageCount, so this index is safe.
+    if (textureIndex >= r->pageCount) return NULL;
+    Texture* tex = &r->base.dataWin->txtr.textures[textureIndex];
     if (tex->blobData != NULL && tex->blobSize > 0) {
         // Parser already loaded the blob (parseTxtr=true path).
         // GameMaker 2022.9+ blobs are '2zoq' (BZip2+QOI):
@@ -269,6 +367,14 @@ static void GCNRenderer_appendQuad(
     bool gradient
 ) {
     if (r->commandCount >= GCN_MAX_QUADS) return;
+#if defined(__has_include)
+#if __has_include(<ogc/gx.h>)
+    {
+        extern volatile uint32_t GCN_diag_drawCalls;
+        GCN_diag_drawCalls++;
+    }
+#endif
+#endif
 
     float g11x = g10x + (g01x - g00x);
     float g11y = g10y + (g01y - g00y);
@@ -344,15 +450,62 @@ static void GCNRenderer_drawSprite(Renderer* base, int32_t tpagIndex, float x, f
     if (tpagIndex < 0 || (uint32_t) tpagIndex >= dataWin->tpag.count) return;
 
     TexturePageItem* tpag = &dataWin->tpag.items[tpagIndex];
+    // BSP path: the packer stores each item as its own packed region. Key the
+    // page cache by TPAG ITEM INDEX and draw ONLY the packed region.
+    //   * the region covers frame coords [cropX, cropX+cropW) x [cropY, +cropH)
+    //   * UVs must span packedW/pageW .. packedH/pageH (NOT 0..1: the page is
+    //     32-aligned padded, so 0..1 would sample transparent padding/neighbours
+    //     and draw the sprite oversized).
+    {
+        extern bool BSP_hasTpag(int32_t);
+        if (BSP_hasTpag(tpagIndex)) {
+            GCNTexturePage* page = GCNRenderer_ensurePage(r, (uint32_t) tpagIndex);
+            if (page == NULL) return;
+            int32_t cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+            extern void BSP_tpagFrameRect(int32_t, int32_t*, int32_t*, int32_t*, int32_t*, int32_t*, int32_t*);
+            int32_t srcX = 0, srcY = 0;
+            BSP_tpagFrameRect(tpagIndex, &srcX, &srcY, &cropX, &cropY, &cropW, &cropH);
+            if (cropW <= 0) cropW = (int32_t) page->packedW;
+            if (cropH <= 0) cropH = (int32_t) page->packedH;
+            // Frame-relative placement of the packed content. The sprite must
+            // appear with its origin at world (x,y), not at world (0,0).
+            // cropX/Y is the content offset within the item; targetX/Y is the
+            // item's position on the source page and is irrelevant here because
+            // the packed page already isolates this item.
+            float lx0 = ((float) cropX - originX) * xscale;
+            float ly0 = ((float) cropY - originY) * yscale;
+            float lx1 = lx0 + (float) cropW * xscale;
+            float ly1 = ly0 + (float) cropH * yscale;
+            float angleRad = -angleDeg * ((float) M_PI / 180.0f);
+            float w00x, w00y, w10x, w10y, w01x, w01y;
+            GCNRenderer_transformPoint2D(x + lx0, y + ly0, x, y, 1.0f, 1.0f, angleRad, &w00x, &w00y);
+            GCNRenderer_transformPoint2D(x + lx1, y + ly0, x, y, 1.0f, 1.0f, angleRad, &w10x, &w10y);
+            GCNRenderer_transformPoint2D(x + lx0, y + ly1, x, y, 1.0f, 1.0f, angleRad, &w01x, &w01y);
+            float uEnd = (float) page->packedW / (float) page->width;
+            float vEnd = (float) page->packedH / (float) page->height;
+            GCNRenderer_appendQuadWorld(
+                r,
+                (uint32_t) tpagIndex,   // item-keyed page
+                w00x, w00y, w10x, w10y, w01x, w01y,
+                0.0f, 0.0f, uEnd, vEnd,
+                color, color, base->drawAlpha * alpha, false
+            );
+            return;
+        }
+    }
     if (tpag->texturePageId < 0 || (uint32_t) tpag->texturePageId >= r->pageCount) return;
     GCNTexturePage* page = GCNRenderer_ensurePage(r, (uint32_t) tpag->texturePageId);
     if (page == NULL) return;
 
     float angleRad = -angleDeg * ((float) M_PI / 180.0f);
     float w00x, w00y, w10x, w10y, w01x, w01y;
-    GCNRenderer_transformPoint2D((float) tpag->targetX, (float) tpag->targetY, originX, originY, xscale, yscale, angleRad, &w00x, &w00y);
-    GCNRenderer_transformPoint2D((float) tpag->targetX + (float) tpag->sourceWidth, (float) tpag->targetY, originX, originY, xscale, yscale, angleRad, &w10x, &w10y);
-    GCNRenderer_transformPoint2D((float) tpag->targetX, (float) tpag->targetY + (float) tpag->sourceHeight, originX, originY, xscale, yscale, angleRad, &w01x, &w01y);
+    float lx0 = ((float) tpag->targetX - (float) originX) * xscale;
+    float ly0 = ((float) tpag->targetY - (float) originY) * yscale;
+    float lx1 = lx0 + (float) tpag->sourceWidth * xscale;
+    float ly1 = ly0 + (float) tpag->sourceHeight * yscale;
+    GCNRenderer_transformPoint2D(x + lx0, y + ly0, x, y, 1.0f, 1.0f, angleRad, &w00x, &w00y);
+    GCNRenderer_transformPoint2D(x + lx1, y + ly0, x, y, 1.0f, 1.0f, angleRad, &w10x, &w10y);
+    GCNRenderer_transformPoint2D(x + lx0, y + ly1, x, y, 1.0f, 1.0f, angleRad, &w01x, &w01y);
 
     GCNRenderer_appendQuadWorld(
         r,
@@ -376,6 +529,33 @@ static void GCNRenderer_drawSpritePart(Renderer* base, int32_t tpagIndex, int32_
     if (tpagIndex < 0 || (uint32_t) tpagIndex >= dataWin->tpag.count) return;
 
     TexturePageItem* tpag = &dataWin->tpag.items[tpagIndex];
+    extern bool BSP_hasTpag(int32_t);
+    if (BSP_hasTpag(tpagIndex)) {
+        // BSP: item-keyed page, packed region covers the item's source rect.
+        // Source-space sub-rect (srcOffX/Y + srcW/H) maps into the packed region.
+        GCNTexturePage* page = GCNRenderer_ensurePage(r, (uint32_t) tpagIndex);
+        if (page == NULL) return;
+        int32_t cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+        extern void BSP_tpagFrameRect(int32_t, int32_t*, int32_t*, int32_t*, int32_t*, int32_t*, int32_t*);
+        int32_t sx = 0, sy = 0;
+        BSP_tpagFrameRect(tpagIndex, &sx, &sy, &cropX, &cropY, &cropW, &cropH);
+        float invW = (float) page->packedW / (float) (cropW > 0 ? cropW : 1);
+        float invH = (float) page->packedH / (float) (cropH > 0 ? cropH : 1);
+        float g00x, g00y, g10x, g10y, g01x, g01y;
+        float x1 = x + (float) srcW * xscale;
+        float y1 = y + (float) srcH * yscale;
+        GCNRenderer_worldToGame(r, x, y, &g00x, &g00y);
+        GCNRenderer_worldToGame(r, x1, y, &g10x, &g10y);
+        GCNRenderer_worldToGame(r, x, y1, &g01x, &g01y);
+        GCNRenderer_appendQuad(r, tpagIndex,
+            g00x, g00y, g10x, g10y, g01x, g01y,
+            (float) (cropX + srcOffX) * invW / (float) page->width,
+            (float) (cropY + srcOffY) * invH / (float) page->height,
+            (float) (cropX + srcOffX + srcW) * invW / (float) page->width,
+            (float) (cropY + srcOffY + srcH) * invH / (float) page->height,
+            color, color, base->drawAlpha * alpha, false);
+        return;
+    }
     if (tpag->texturePageId < 0 || (uint32_t) tpag->texturePageId >= r->pageCount) return;
     GCNTexturePage* page = GCNRenderer_ensurePage(r, (uint32_t) tpag->texturePageId);
     if (page == NULL) return;
@@ -401,6 +581,17 @@ static void GCNRenderer_drawSpritePart(Renderer* base, int32_t tpagIndex, int32_
 static void GCNRenderer_drawRectangle(Renderer* base, float x1, float y1, float x2, float y2, uint32_t color, float alpha, bool outline) {
     GCNRenderer_lastDrawCall = "drawRectangle";
     GCNRenderer* r = (GCNRenderer*) base;
+#if defined(__has_include)
+#if __has_include(<ogc/gx.h>)
+    {
+        extern void GCN_bootlog(const char* fmt, ...);
+        static int rectLogged = 0;
+        if (rectLogged++ < 10)
+            GCN_bootlog("[DRAWRECT] x1=%.1f y1=%.1f x2=%.1f y2=%.1f color=%06X alpha=%.2f outline=%d drawColor=%06X drawAlpha=%.2f",
+                x1, y1, x2, y2, color, alpha, (int) outline, base->drawColor, base->drawAlpha);
+    }
+#endif
+#endif
     if (outline) {
         r->base.vtable->drawLine(base, x1, y1, x2, y1, 1.0f, color, alpha);
         r->base.vtable->drawLine(base, x2, y1, x2, y2, 1.0f, color, alpha);
@@ -467,17 +658,55 @@ static void GCNRenderer_drawLineColor(Renderer* base, float x1, float y1, float 
 static void GCNRenderer_drawTextCommon(Renderer* base, const char* text, float x, float y, float xscale, float yscale, float angleDeg, bool gradient, int32_t c1, float alpha) {
     GCNRenderer_lastDrawCall = "drawText";
     DataWin* dataWin = base->dataWin;
-    if (base->drawFont < 0 || (uint32_t) base->drawFont >= dataWin->font.count) return;
+    if (base->drawFont < 0 || (uint32_t) base->drawFont >= dataWin->font.count) {
+        extern void GCN_bootlog(const char* fmt, ...);
+        static int noFontLogged = 0;
+        if (noFontLogged++ < 3) GCN_bootlog("[DRAWTEXT] SKIPPED drawFont=%d (invalid, fonts=%u) text='%.20s'",
+            (int) base->drawFont, (unsigned) dataWin->font.count, text ? text : "");
+        return;
+    }
 
     GCNRenderer* r = (GCNRenderer*) base;
     Font* font = &dataWin->font.fonts[base->drawFont];
     int32_t fontTpagIndex = font->tpagIndex;
-    if (fontTpagIndex < 0 || (uint32_t) fontTpagIndex >= dataWin->tpag.count) return;
+    if (fontTpagIndex < 0 || (uint32_t) fontTpagIndex >= dataWin->tpag.count) {
+        extern void GCN_bootlog(const char* fmt, ...);
+        static int ftLogged = 0;
+        if (ftLogged++ < 3) GCN_bootlog("[DRAWTEXT] font %d tpagIndex=%d INVALID (tpags=%u)",
+            (int) base->drawFont, (int) fontTpagIndex, (unsigned) dataWin->tpag.count);
+        return;
+    }
 
     TexturePageItem* fontTpag = &dataWin->tpag.items[fontTpagIndex];
-    if (fontTpag->texturePageId < 0 || (uint32_t) fontTpag->texturePageId >= r->pageCount) return;
-    GCNTexturePage* page = GCNRenderer_ensurePage(r, (uint32_t) fontTpag->texturePageId);
-    if (page == NULL) return;
+    extern bool BSP_hasTpag(int32_t);
+    bool bspFontPage = BSP_hasTpag((int32_t) fontTpagIndex);
+    // BSP font pages are keyed by ITEM index, so the TXTR pageId bound must
+    // not gate them (TPAG[17].pageId=2 while pageCount=TXTR count=9; and
+    // item indices run to 3008).
+    if (!bspFontPage && (fontTpag->texturePageId < 0 || (uint32_t) fontTpag->texturePageId >= r->pageCount)) {
+        extern void GCN_bootlog(const char* fmt, ...);
+        static int pgLogged = 0;
+        if (pgLogged++ < 3) GCN_bootlog("[DRAWTEXT] pageId=%d INVALID (pageCount=%u)",
+            (int) fontTpag->texturePageId, (unsigned) r->pageCount);
+        return;
+    }
+    GCNTexturePage* page = GCNRenderer_ensurePage(r, (uint32_t) fontTpagIndex);
+    if (page == NULL) {
+        extern void GCN_bootlog(const char* fmt, ...);
+        static int epLogged = 0;
+        if (epLogged++ < 3) GCN_bootlog("[DRAWTEXT] ensurePage(item %u) NULL", (unsigned) fontTpagIndex);
+        return;
+    }
+
+    // DIAGNOSTIC: log the FULL string the game asks us to draw (capped).
+    {
+        extern void GCN_bootlog(const char* fmt, ...);
+        static int fullLog = 0;
+        if (fullLog++ < 6)
+            GCN_bootlog("[DRAWFULL] font=%d x=%.1f y=%.1f len=%u text='%.64s'",
+                (int) base->drawFont, x, y,
+                (unsigned) (text != NULL ? strlen(text) : 0), text != NULL ? text : "");
+    }
 
     PreprocessedText processed = TextUtils_preprocessGmlText(text);
     const char* processedText = processed.text;
@@ -493,6 +722,33 @@ static void GCNRenderer_drawTextCommon(Renderer* base, const char* text, float x
     float effYScale = yscale * font->scaleY;
     float pivotX = x;
     float pivotY = y + valignOffset;
+
+    // BSP font texture: the font's TPAG item is packed as its own region.
+    // Glyph coords (glyph->sourceX/Y) are RELATIVE to the item's source rect
+    // (verified against all 12 ch1 fonts: max glyph x < item sourceWidth).
+    // The packed region covers [cropX, cropX+cropW) x [cropY, cropY+cropH) of
+    // that source rect, so a source-relative coord maps to
+    //   u = (cropX + glyphX) * packedW / cropW / width
+    // The earlier (fontTpag->sourceX + glyphX - cropX)/cropW form added the
+    // sheet's absolute page position (fnt_main sourceX=473) and pushed every
+    // glyph UV past 1.0 => the blitter discarded all of them (no text, ever).
+    bool bspFont = false;
+    uint32_t fPackedW = 0, fPackedH = 0, fCropW = 0, fCropH = 0, fCropX = 0, fCropY = 0;
+    {
+        extern bool BSP_hasTpag(int32_t);
+        extern void BSP_tpagFrameRect(int32_t, int32_t*, int32_t*, int32_t*, int32_t*, int32_t*, int32_t*);
+        if (BSP_hasTpag((int32_t) fontTpagIndex)) {
+            int32_t sx = 0, sy = 0, cx = 0, cy = 0, cw = 0, ch = 0;
+            BSP_tpagFrameRect(fontTpagIndex, &sx, &sy, &cx, &cy, &cw, &ch);
+            bspFont = true;
+            fCropX = (uint32_t) cx;
+            fCropY = (uint32_t) cy;
+            fCropW = (uint32_t) (cw > 0 ? cw : (int32_t) page->packedW);
+            fCropH = (uint32_t) (ch > 0 ? ch : (int32_t) page->packedH);
+            fPackedW = page->packedW ? page->packedW : fCropW;
+            fPackedH = page->packedH ? page->packedH : fCropH;
+        }
+    }
 
     float cursorY = y + valignOffset;
     int32_t lineStart = 0;
@@ -511,7 +767,12 @@ static void GCNRenderer_drawTextCommon(Renderer* base, const char* text, float x
         while (pos < lineLen) {
             uint16_t ch = TextUtils_decodeUtf8(processedText + lineStart, lineLen, &pos);
             FontGlyph* glyph = TextUtils_findGlyph(font, ch);
-            if (glyph == NULL) continue;
+            if (glyph == NULL) {
+                extern void GCN_bootlog(const char* fmt, ...);
+                static int ngLogged = 0;
+                if (ngLogged++ < 4) GCN_bootlog("[DRAWTEXT] glyph U+%04X MISSING (glyphs=%u)", (unsigned) ch, (unsigned) font->glyphCount);
+                continue;
+            }
             if (glyph->sourceWidth == 0 || glyph->sourceHeight == 0) {
                 cursorX += glyph->shift;
                 continue;
@@ -527,6 +788,24 @@ static void GCNRenderer_drawTextCommon(Renderer* base, const char* text, float x
             GCNRenderer_transformPoint2D(lx0, ly1, pivotX, pivotY, effXScale, effYScale, angleRad, &w01x, &w01y);
 
             uint32_t color = gradient ? (uint32_t) c1 : base->drawColor;
+            if (bspFont) {
+                // Item-keyed BSP page. Glyph coords are source-rect-relative;
+                // map them through the crop rect into the packed region.
+                //   u = (cropX + glyphX) * (packedW / cropW) / pageW
+                float invW = (float) fPackedW / (float) (fCropW ? fCropW : 1u);
+                float invH = (float) fPackedH / (float) (fCropH ? fCropH : 1u);
+                float u0 = (float) (fCropX + glyph->sourceX) * invW / (float) page->width;
+                float v0 = (float) (fCropY + glyph->sourceY) * invH / (float) page->height;
+                float u1 = (float) (fCropX + glyph->sourceX + glyph->sourceWidth) * invW / (float) page->width;
+                float v1 = (float) (fCropY + glyph->sourceY + glyph->sourceHeight) * invH / (float) page->height;
+                GCNRenderer_appendQuadWorld(
+                    r,
+                    (uint32_t) fontTpagIndex,   // item-keyed page
+                    w00x, w00y, w10x, w10y, w01x, w01y,
+                    u0, v0, u1, v1,
+                    color, color, base->drawAlpha * alpha, false
+                );
+            } else {
             GCNRenderer_appendQuadWorld(
                 r,
                 fontTpag->texturePageId,
@@ -537,6 +816,7 @@ static void GCNRenderer_drawTextCommon(Renderer* base, const char* text, float x
                 (float) (fontTpag->sourceY + glyph->sourceY + glyph->sourceHeight) / (float) (page->height * page->scale),
                 color, color, base->drawAlpha * alpha, false
             );
+            }
 
             cursorX += glyph->shift;
             if (pos < lineLen) {
@@ -623,18 +903,44 @@ static void GCNRenderer_renderCommands(GCNRenderer* r, uint32_t clearR, uint32_t
     // SOFTWARE PATH: clear the XFB to black on CPU, then blit every quad
     // directly. No GX involvement at all - same pixel path as the console
     // text that provably reaches this TV.
-    u16* xfb = (u16*) GCN_getXfb(GCN_getXfbIndex());
+    u16* xfb = (u16*) GCN_getXfb(GCN_getXfbIndex()); // back buffer of the moment
     GXRModeObj* rmode = GCN_getRMode();
     uint32_t stride = rmode->fbWidth;
+    // XFB pixel-pair layout. PPC is BIG-ENDIAN: a u16 value is stored with its
+    // HIGH byte first, so the word (Y<<8)|C lands in memory as [Y, C] - which
+    // is exactly the YUYV order the VI reads and matches libogc's colorTable
+    // (black = bytes 10 80, white = F0 80). This was correct all along; do NOT
+    // "fix" it to (C<<8)|Y - that stores [C, Y] and paints the screen pure
+    // green (Y=128,C=16 -> RGB(0,255,0)).
+    // ===[ CLEAR + IMMEDIATE READ-BACK ]===
+    // Write the whole frame black, then IMMEDIATELY verify by reading the same
+    // pointer back. This distinguishes "our writes do not reach the memory the
+    // VI scans" (pointer/stride/cache error) from "something overwrites us
+    // later". Logged every 600 frames so drift is visible.
     for (uint32_t yyy = 0; yyy < 480; ++yyy) {
         u16* row = xfb + yyy * stride;
         for (uint32_t xxx = 0; xxx < 640; xxx += 2) {
-            // pair layout: u16[2n]=(Y1<<8)|V, u16[2n+1]=(Y0<<8)|U
-            row[xxx] = (u16) ((16 << 8) | 0x80);
-            row[xxx + 1] = (u16) ((16 << 8) | 0x80);
+            row[xxx] = (u16) ((16 << 8) | 0x80);      // [Y=16, Cb=128] = black
+            row[xxx + 1] = (u16) ((16 << 8) | 0x80);  // [Y=16, Cr=128]
+        }
+    }
+    {
+        extern void GCN_bootlog(const char* fmt, ...);
+        static int clearLogged = 0;
+        if (clearLogged++ < 3) {
+            uint16_t* p16 = (uint16_t*) xfb;
+            uint16_t* midRow = (uint16_t*) (xfb + 240u * stride);
+            GCN_bootlog("[CLEAR] stride=%u p16[0]=%04X p16[1]=%04X p16[639]=%04X mid[0]=%04X (want 1080 everywhere)",
+                (unsigned) stride, (unsigned) p16[0], (unsigned) p16[1],
+                (unsigned) p16[639], (unsigned) midRow[0]);
         }
     }
     GCNRenderer_statsCommands = r->commandCount;
+    // ===[ SWATCH REMOVED ]===
+    // The 4-band discriminator did its job as a diagnostic but the Architect
+    // does not want it on screen. The [CLEAR] read-back log above now provides
+    // the same information (raw pixel words straight out of the framebuffer)
+    // without drawing anything. Keep the screen clean for the game.
     if (r->commandCount == 0) return;
 
     float scaleX = 640.0f / (float) r->frameW;
@@ -688,17 +994,24 @@ static void GCNRenderer_renderCommands(GCNRenderer* r, uint32_t clearR, uint32_t
             p00x, p00y, p10x, p10y, p01x, p01y,
             command->u0, command->v0, command->u1, command->v1,
             mr, mg, mb, ma);
+
+        // TEXT-PIXEL EVIDENCE: count blitted quads that actually wrote pixels
+        // for a texture-backed command, and remember the first UV pair we see.
+        if (pageBuf != NULL) {
+            GCN_diag_texturedBlits++;
+            if (GCN_diag_firstU < -900.0f) {
+                GCN_diag_firstU = command->u0;
+                GCN_diag_firstV = command->v0;
+                GCN_diag_firstU1 = command->u1;
+                GCN_diag_firstV1 = command->v1;
+                GCN_diag_firstTexW = pageW;
+                GCN_diag_firstTexH = pageH;
+            }
+        }
     }
 
-    // GUARANTEED-VISIBLE marker: a solid white square marching across the
-    // top edge, drawn through THIS SAME blitter. If it shows on TV, the
-    // pixel path works and any invisibility is in the game's draw calls.
-    static uint32_t swrMarkerX = 0;
-    swrMarkerX = (swrMarkerX + 4) % 600;
-    GCN_swr_blitQuad(xfb, stride, NULL, 0, 0,
-        (float) swrMarkerX, 4.0f, (float) swrMarkerX + 24.0f, 4.0f,
-        (float) swrMarkerX, 28.0f,
-        0.0f, 0.0f, 1.0f, 1.0f, 255, 255, 255, 255);
+    // (The marching diagnostic square was REMOVED: game text renders, so the
+    //  blitter path is proven. Keeping it would only draw over the game.)
 
     r->commandCount = 0;
 }
